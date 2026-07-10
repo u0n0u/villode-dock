@@ -455,6 +455,7 @@ def run_dock():
             self.last_frame_us = None
             self.last_input_rects = None
             self.clients = []
+            self.trash_full = False
             self.refresh_in_flight = False
             self.external_drag_active = False
             self.external_drop_index = None
@@ -1406,6 +1407,63 @@ def run_dock():
             item.connect("activate", callback)
             return item
 
+        def empty_trash(self):
+            dialog = Gtk.MessageDialog(
+                transient_for=self.host_window,
+                modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.NONE,
+                text="确定要清空废纸篓吗？",
+            )
+            dialog.format_secondary_text(
+                "废纸篓中的项目将被永久删除，此操作无法撤销。"
+            )
+            dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+            dialog.add_button("清空废纸篓", Gtk.ResponseType.ACCEPT)
+            dialog.set_default_response(Gtk.ResponseType.CANCEL)
+            response = dialog.run()
+            dialog.destroy()
+            if response != Gtk.ResponseType.ACCEPT:
+                return
+
+            def worker():
+                try:
+                    result = subprocess.run(
+                        ["gio", "trash", "--empty"],
+                        check=False,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=30,
+                    )
+                    success = result.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    success = False
+                GLib.idle_add(self.finish_empty_trash, success)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def finish_empty_trash(self, success):
+            if success:
+                if self.apply_trash_state(False):
+                    self.queue_draw()
+                self.request_state_refresh()
+                return GLib.SOURCE_REMOVE
+
+            dialog = Gtk.MessageDialog(
+                transient_for=self.host_window,
+                modal=True,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.CLOSE,
+                text="无法清空废纸篓",
+            )
+            dialog.format_secondary_text(
+                "系统未能完成清理，请打开文件管理器后重试。"
+            )
+            dialog.run()
+            dialog.destroy()
+            return GLib.SOURCE_REMOVE
+
         def show_context_menu(self, event, index):
             menu = Gtk.Menu()
             if index is not None:
@@ -1426,6 +1484,13 @@ def run_dock():
                             lambda _item, i=index: self.activate(i, force_new=True),
                         )
                     )
+                if dock_item["action"] == "trash":
+                    empty_item = self.menu_item(
+                        "清空废纸篓…",
+                        lambda _item: self.empty_trash(),
+                    )
+                    empty_item.set_sensitive(self.trash_full)
+                    menu.append(empty_item)
                 if dock_item["removable"]:
                     menu.append(
                         self.menu_item(
@@ -1533,17 +1598,32 @@ def run_dock():
                     item["running"] = running
                     changed = True
 
-            trash_item = self.items[-1]
+            if self.apply_trash_state(trash_full):
+                changed = True
+
+            if changed:
+                self.queue_draw()
+            return False
+
+        def apply_trash_state(self, trash_full):
+            self.trash_full = bool(trash_full)
+            trash_item = next(
+                (
+                    item
+                    for item in self.items
+                    if item["kind"] == "place" and item["action"] == "trash"
+                ),
+                None,
+            )
+            if trash_item is None:
+                return False
             asset_name = "trash-full.png" if trash_full else "trash-empty.png"
             fallback_icon = "user-trash-full" if trash_full else "user-trash"
             if trash_item["asset_name"] != asset_name:
                 trash_item["asset_name"] = asset_name
                 trash_item["fallback_icon"] = fallback_icon
                 trash_item["pixbuf"] = self.load_icon(asset_name, fallback_icon)
-                changed = True
-
-            if changed:
-                self.queue_draw()
+                return True
             return False
 
         def apply_input_region(self):
