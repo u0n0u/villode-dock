@@ -90,13 +90,19 @@ EOF
 
   mkdir -p "$HYPR_DIR"
   touch "$HYPR_MAIN"
-  if ! grep -Eq 'source *=.*villode-dock\.conf' "$HYPR_MAIN"; then
-    {
-      echo
-      echo "# Villode Dock"
-      echo "source = ~/.config/hypr/conf.d/villode-dock.conf"
-    } >> "$HYPR_MAIN"
+  if grep -Eq 'source *=.*villode-dock\.conf' "$HYPR_MAIN"; then
+    return
   fi
+  if grep -Eq 'villode-dock --daemon|match:namespace villode-dock|\$dock *= *villode-dock' "$HYPR_MAIN"; then
+    echo "Hyprland already contains Villode Dock entries; not appending a source line."
+    echo "Fresh Dock config was still written to: $HYPR_INCLUDE"
+    return
+  fi
+  {
+    echo
+    echo "# Villode Dock"
+    echo "source = ~/.config/hypr/conf.d/villode-dock.conf"
+  } >> "$HYPR_MAIN"
 }
 
 if [ ! -x "$SOURCE_DOCK" ]; then
