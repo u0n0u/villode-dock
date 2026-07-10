@@ -1465,24 +1465,97 @@ def run_dock():
             return GLib.SOURCE_REMOVE
 
         def show_about(self):
-            dialog = Gtk.MessageDialog(
+            dialog = Gtk.Dialog(
+                title="关于 Villode Dock",
                 transient_for=self.host_window,
                 modal=True,
-                message_type=Gtk.MessageType.INFO,
-                buttons=Gtk.ButtonsType.NONE,
-                text="Villode Dock",
             )
-            dialog.format_secondary_text(
-                "面向 Hyprland 的 macOS 风格 Dock。\n\n"
-                "部分图标来自 macOSicons.com，版权归相应作者。"
+            dialog.set_default_size(430, 330)
+            dialog.set_resizable(False)
+            dialog.set_decorated(True)
+
+            header = Gtk.HeaderBar()
+            header.set_title("关于")
+            header.set_show_close_button(True)
+            dialog.set_titlebar(header)
+
+            content = dialog.get_content_area()
+            content.set_border_width(0)
+
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            page.set_margin_start(34)
+            page.set_margin_end(34)
+            page.set_margin_top(28)
+            page.set_margin_bottom(24)
+            content.pack_start(page, True, True, 0)
+
+            icon = Gtk.Image.new_from_icon_name(
+                "user-desktop-symbolic",
+                Gtk.IconSize.DIALOG,
             )
-            dialog.add_button("完整图标署名", Gtk.ResponseType.HELP)
-            dialog.add_button("关闭", Gtk.ResponseType.CLOSE)
-            dialog.set_default_response(Gtk.ResponseType.CLOSE)
-            response = dialog.run()
+            icon.set_pixel_size(62)
+            icon.set_margin_bottom(14)
+            page.pack_start(icon, False, False, 0)
+
+            name = Gtk.Label()
+            name.set_markup(
+                "<span size='xx-large' weight='bold'>Villode Dock</span>"
+            )
+            name.set_justify(Gtk.Justification.CENTER)
+            page.pack_start(name, False, False, 0)
+
+            summary = Gtk.Label(
+                label="为 Hyprland 与 Wayland 设计的桌面 Dock"
+            )
+            summary.get_style_context().add_class("dim-label")
+            summary.set_margin_top(5)
+            summary.set_margin_bottom(20)
+            page.pack_start(summary, False, False, 0)
+
+            details = Gtk.Label()
+            details.set_markup(
+                "<span>GTK 3  ·  GtkLayerShell  ·  实时合成器模糊</span>"
+            )
+            details.set_justify(Gtk.Justification.CENTER)
+            details.set_margin_bottom(16)
+            page.pack_start(details, False, False, 0)
+
+            project = Gtk.Label()
+            project.set_markup(
+                "<a href='https://github.com/Villode/villode-dock'>"
+                "GitHub 项目主页</a>"
+            )
+            project.connect(
+                "activate-link",
+                lambda _label, uri: spawn_command(["xdg-open", uri]),
+            )
+            page.pack_start(project, False, False, 0)
+
+            separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            separator.set_margin_top(22)
+            separator.set_margin_bottom(15)
+            page.pack_start(separator, False, False, 0)
+
+            credits = Gtk.Label()
+            credits.set_markup(
+                "部分图标来自 macOSicons.com 及相应作者"
+                "  ·  <a href='villode-credits://icons'>完整署名</a>"
+            )
+            credits.get_style_context().add_class("dim-label")
+            credits.set_justify(Gtk.Justification.CENTER)
+
+            def open_credits(_label, uri):
+                if uri == "villode-credits://icons":
+                    spawn_command(["xdg-open", str(ICON_CREDITS)])
+                    return True
+                return False
+
+            credits.connect("activate-link", open_credits)
+            page.pack_end(credits, False, False, 0)
+
+            dialog.show_all()
+            dialog.run()
             dialog.destroy()
-            if response == Gtk.ResponseType.HELP:
-                spawn_command(["xdg-open", str(ICON_CREDITS)])
 
         def show_context_menu(self, event, index):
             menu = Gtk.Menu()
