@@ -23,6 +23,7 @@ done
 
 "$HOME/.local/bin/villode-dock" --quit >/dev/null 2>&1 || true
 rm -f "$HOME/.local/bin/villode-dock"
+rm -f "$HOME/.local/bin/villode-drag-preview"
 rm -rf "$HOME/.local/share/villode-dock"
 rm -f "$HOME/.config/hypr/conf.d/villode-dock.conf"
 

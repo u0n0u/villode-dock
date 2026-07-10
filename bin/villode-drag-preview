@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import cairo
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("GLib", "2.0")
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, GtkLayerShell
+
+
+def load_icon(icon, size):
+    path = Path(icon)
+    if path.is_file():
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                str(path), size, size, True
+            )
+        except GLib.Error:
+            pass
+    theme = Gtk.IconTheme.get_default()
+    for name in (icon, "application-x-executable", "image-missing"):
+        if not name:
+            continue
+        try:
+            return theme.load_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
+        except GLib.Error:
+            pass
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--icon", required=True)
+    parser.add_argument("--size", type=int, default=82)
+    args = parser.parse_args()
+
+    size = max(24, min(args.size, 160))
+    pixbuf = load_icon(args.icon, size)
+    position = {"x": -1000.0, "y": -1000.0}
+
+    window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    window.set_title("Villode Drag Preview")
+    window.set_decorated(False)
+    window.set_app_paintable(True)
+    window.set_accept_focus(False)
+    window.set_skip_taskbar_hint(True)
+    window.set_skip_pager_hint(True)
+
+    screen = window.get_screen()
+    visual = screen.get_rgba_visual()
+    if visual is not None:
+        window.set_visual(visual)
+
+    GtkLayerShell.init_for_window(window)
+    GtkLayerShell.set_namespace(window, "villode-drag-preview")
+    GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+    GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.NONE)
+    for edge in (
+        GtkLayerShell.Edge.TOP,
+        GtkLayerShell.Edge.BOTTOM,
+        GtkLayerShell.Edge.LEFT,
+        GtkLayerShell.Edge.RIGHT,
+    ):
+        GtkLayerShell.set_anchor(window, edge, True)
+    GtkLayerShell.set_exclusive_zone(window, -1)
+
+    canvas = Gtk.DrawingArea()
+    window.add(canvas)
+
+    def draw(_widget, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        if pixbuf is not None:
+            x = position["x"] - size / 2.0
+            y = position["y"] - size / 2.0
+            cr.save()
+            cr.translate(x, y)
+            cr.scale(size / pixbuf.get_width(), size / pixbuf.get_height())
+            Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+            cr.paint()
+            cr.restore()
+        return False
+
+    canvas.connect("draw", draw)
+
+    def make_click_through(widget):
+        gdk_window = widget.get_window()
+        if gdk_window is not None:
+            gdk_window.input_shape_combine_region(cairo.Region(), 0, 0)
+
+    window.connect("realize", make_click_through)
+
+    def stdin_ready(stream, condition):
+        if condition & (GLib.IO_HUP | GLib.IO_ERR):
+            Gtk.main_quit()
+            return False
+        line = stream.readline()
+        if not line:
+            Gtk.main_quit()
+            return False
+        try:
+            x, y = map(float, line.split()[:2])
+        except (ValueError, IndexError):
+            return True
+        position["x"] = x
+        position["y"] = y
+        canvas.queue_draw()
+        return True
+
+    GLib.io_add_watch(
+        sys.stdin,
+        GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+        stdin_ready,
+    )
+    window.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

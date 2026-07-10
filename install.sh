@@ -30,8 +30,10 @@ done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DOCK="$SCRIPT_DIR/bin/villode-dock"
+SOURCE_PREVIEW="$SCRIPT_DIR/bin/villode-drag-preview"
 SOURCE_ICONS="$SCRIPT_DIR/assets/dock-icons"
 INSTALL_DOCK="$HOME/.local/bin/villode-dock"
+INSTALL_PREVIEW="$HOME/.local/bin/villode-drag-preview"
 INSTALL_ICONS="$HOME/.local/share/villode-dock/icons"
 HYPR_DIR="$HOME/.config/hypr"
 HYPR_MAIN="$HYPR_DIR/hyprland.conf"
@@ -101,6 +103,10 @@ if [ ! -x "$SOURCE_DOCK" ]; then
   echo "Missing executable: $SOURCE_DOCK" >&2
   exit 1
 fi
+if [ ! -x "$SOURCE_PREVIEW" ]; then
+  echo "Missing executable: $SOURCE_PREVIEW" >&2
+  exit 1
+fi
 if [ ! -d "$SOURCE_ICONS" ]; then
   echo "Missing Dock icons: $SOURCE_ICONS" >&2
   exit 1
@@ -118,9 +124,10 @@ fi
 
 mkdir -p "$(dirname "$INSTALL_DOCK")" "$INSTALL_ICONS"
 install -m 755 "$SOURCE_DOCK" "$INSTALL_DOCK"
+install -m 755 "$SOURCE_PREVIEW" "$INSTALL_PREVIEW"
 install -m 644 "$SOURCE_ICONS"/*.png "$INSTALL_ICONS"/
 install -m 644 "$SOURCE_ICONS/CREDITS.md" "$INSTALL_ICONS/CREDITS.md"
-python3 -m py_compile "$INSTALL_DOCK"
+python3 -m py_compile "$INSTALL_DOCK" "$INSTALL_PREVIEW"
 
 if [ "$SETUP_HYPRLAND" -eq 1 ]; then
   write_hyprland_config
@@ -134,6 +141,7 @@ if [ "$START_DOCK" -eq 1 ]; then
 fi
 
 echo "Installed: $INSTALL_DOCK"
+echo "Installed: $INSTALL_PREVIEW"
 echo "Dock icons: $INSTALL_ICONS"
 if [ "$SETUP_HYPRLAND" -eq 1 ]; then
   echo "Hyprland config: $HYPR_INCLUDE"
