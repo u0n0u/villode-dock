@@ -1464,6 +1464,26 @@ def run_dock():
             dialog.destroy()
             return GLib.SOURCE_REMOVE
 
+        def show_about(self):
+            dialog = Gtk.MessageDialog(
+                transient_for=self.host_window,
+                modal=True,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Villode Dock",
+            )
+            dialog.format_secondary_text(
+                "面向 Hyprland 的 macOS 风格 Dock。\n\n"
+                "部分图标来自 macOSicons.com，版权归相应作者。"
+            )
+            dialog.add_button("完整图标署名", Gtk.ResponseType.HELP)
+            dialog.add_button("关闭", Gtk.ResponseType.CLOSE)
+            dialog.set_default_response(Gtk.ResponseType.CLOSE)
+            response = dialog.run()
+            dialog.destroy()
+            if response == Gtk.ResponseType.HELP:
+                spawn_command(["xdg-open", str(ICON_CREDITS)])
+
         def show_context_menu(self, event, index):
             menu = Gtk.Menu()
             if index is not None:
@@ -1515,14 +1535,14 @@ def run_dock():
             menu.append(Gtk.SeparatorMenuItem())
             menu.append(
                 self.menu_item(
-                    "图标鸣谢：macOSicons.com",
-                    lambda _item: spawn_command(["xdg-open", str(ICON_CREDITS)]),
+                    "重新载入 Dock",
+                    lambda _item: spawn_command([sys.executable, str(SCRIPT), "--reload"]),
                 )
             )
             menu.append(
                 self.menu_item(
-                    "重新载入 Dock",
-                    lambda _item: spawn_command([sys.executable, str(SCRIPT), "--reload"]),
+                    "关于 Villode Dock…",
+                    lambda _item: self.show_about(),
                 )
             )
             menu.show_all()
