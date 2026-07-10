@@ -13,6 +13,7 @@
 - 透明输入区域与窗口防遮挡
 - 空闲时停止动画刷新
 - 可选连接 Villode Launcher，从启动台拖入应用并精确固定
+- 检测到 [Villode Desktop](https://github.com/Villode/villode-desktop) 时显示桌面设置入口
 
 ## 适配环境
 

@@ -536,7 +536,13 @@ def run_dock():
             for key in self.pinned_keys[:MAX_PINNED_ITEMS]:
                 if key.startswith("builtin:"):
                     action = key.split(":", 1)[1]
-                    if action == "launcher" and shutil.which("villode-launcher") is None:
+                    if (
+                        action == "launcher"
+                        and shutil.which("villode-launcher") is None
+                    ) or (
+                        action == "desktop-settings"
+                        and shutil.which("villode-desktop") is None
+                    ):
                         continue
                     spec = BUILTIN_ITEMS.get(action)
                     if spec is None:
