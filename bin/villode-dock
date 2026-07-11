@@ -3,6 +3,7 @@
 
 import argparse
 import configparser
+import fcntl
 import json
 import math
 import os
@@ -13,18 +14,23 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
 PID_FILE = Path.home() / ".cache" / "villode-dock.pid"
+PID_LOCK_FILE = Path.home() / ".cache" / "villode-dock.instance.lock"
+OPERATION_LOCK_FILE = Path.home() / ".cache" / "villode-dock.operation.lock"
 SCRIPT = Path(__file__).resolve()
 ICON_DIR = Path.home() / ".local" / "share" / "villode-dock" / "icons"
 ICON_CREDITS = ICON_DIR / "CREDITS.md"
 CONFIG_DIR = Path.home() / ".config" / "villode-dock"
 PINS_FILE = CONFIG_DIR / "pins.json"
+PINS_LOCK_FILE = CONFIG_DIR / "pins.lock"
 CAELESTIA_CONFIG = Path.home() / ".config" / "caelestia" / "shell.json"
 DOCK_CONTROL_SOCKET = Path.home() / ".cache" / "villode-dock-control.sock"
 DOCK_APP_MIME = "application/x-villode-dock-app+json"
@@ -88,6 +94,58 @@ RUNNING_CLASSES = {
 FOCUSABLE = frozenset(RUNNING_CLASSES)
 
 
+@contextmanager
+def exclusive_lock(path, blocking=True):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    try:
+        fcntl.flock(handle.fileno(), flags)
+    except BlockingIOError:
+        handle.close()
+        yield None
+        return
+    try:
+        yield handle
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def write_text_atomic(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def command_program(command):
+    words = list(command or ())
+    if words and Path(words[0]).name == "env":
+        words.pop(0)
+        while words and (words[0].startswith("-") or "=" in words[0]):
+            option = words.pop(0)
+            if option in {"-u", "--unset", "-C", "--chdir"} and words:
+                words.pop(0)
+    while words and "=" in words[0] and not words[0].startswith(("/", "./")):
+        words.pop(0)
+    return words[0] if words else ""
+
+
+def command_executable(command):
+    program = command_program(command)
+    return Path(program).name if program else ""
+
+
 def caelestia_explorer_command():
     """Read Caelestia's current file manager command on every activation."""
     try:
@@ -95,14 +153,21 @@ def caelestia_explorer_command():
         command = payload["general"]["apps"]["explorer"]
     except (FileNotFoundError, OSError, KeyError, TypeError, json.JSONDecodeError):
         return None
+    if isinstance(command, str):
+        try:
+            command = shlex.split(command)
+        except ValueError:
+            return None
     if not isinstance(command, list) or not command:
         return None
     command = [str(part) for part in command if str(part)]
     if not command:
         return None
-    executable = command[0]
-    if shutil.which(executable) is None and not (
-        Path(executable).is_file() and os.access(executable, os.X_OK)
+    program = command_program(command)
+    executable_path = Path(program).expanduser()
+    if not program or (
+        shutil.which(program) is None
+        and not (executable_path.is_file() and os.access(executable_path, os.X_OK))
     ):
         return None
     return command
@@ -111,8 +176,71 @@ def caelestia_explorer_command():
 def file_manager_command(target):
     command = caelestia_explorer_command()
     if command is None:
-        return ["xdg-open", str(target)]
-    return [*command, str(target)]
+        return ["gio", "open", str(target)]
+    target = str(target)
+    result = []
+    inserted = False
+    for part in command:
+        if part in {"%f", "%F", "%u", "%U"}:
+            result.append(target)
+            inserted = True
+        elif part in {"%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m"}:
+            continue
+        else:
+            result.append(part)
+    if not inserted:
+        result.append(target)
+    return result
+
+
+_FILE_MANAGER_PATTERN_CACHE = {}
+
+
+def file_manager_patterns():
+    command = caelestia_explorer_command()
+    executable = command_executable(command)
+    cache_key = tuple(command or ())
+    cached = _FILE_MANAGER_PATTERN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    patterns = list(RUNNING_CLASSES["files"])
+    executable_lower = executable.casefold()
+    for value in (executable_lower, Path(executable_lower).stem):
+        if value and value not in patterns:
+            patterns.append(value)
+
+    desktop_ids = []
+    if command and Path(command[0]).name in {"gtk-launch", "gio"}:
+        desktop_ids.extend(
+            part for part in command[1:] if isinstance(part, str) and part.endswith(".desktop")
+        )
+    for directory in APP_DIRS:
+        try:
+            entries = tuple(directory.glob("*.desktop"))
+        except OSError:
+            continue
+        for path in entries:
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                parser.read(path, encoding="utf-8")
+                entry = parser["Desktop Entry"]
+                words = shlex.split(entry.get("Exec", ""))
+            except (OSError, KeyError, ValueError, configparser.Error):
+                continue
+            if path.name not in desktop_ids and (
+                not executable_lower
+                or command_executable(words).casefold() != executable_lower
+            ):
+                continue
+            for value in (entry.get("StartupWMClass", ""), path.stem):
+                value = value.strip().casefold()
+                if value and value not in patterns:
+                    patterns.append(value)
+    result = tuple(patterns)
+    _FILE_MANAGER_PATTERN_CACHE.clear()
+    _FILE_MANAGER_PATTERN_CACHE[cache_key] = result
+    return result
 
 
 def valid_desktop_id(value):
@@ -127,11 +255,12 @@ def valid_desktop_id(value):
 
 
 def load_pinned_keys():
-    try:
-        payload = json.loads(PINS_FILE.read_text(encoding="utf-8"))
-        raw_items = payload.get("items", []) if isinstance(payload, dict) else []
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return list(DEFAULT_PINNED_KEYS)
+    with exclusive_lock(PINS_LOCK_FILE):
+        try:
+            payload = json.loads(PINS_FILE.read_text(encoding="utf-8"))
+            raw_items = payload.get("items", []) if isinstance(payload, dict) else []
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return list(DEFAULT_PINNED_KEYS)
 
     result = []
     for raw in raw_items if isinstance(raw_items, list) else []:
@@ -157,11 +286,10 @@ def load_pinned_keys():
 def save_pinned_keys(keys):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     payload = {"version": 1, "items": list(keys[:MAX_PINNED_ITEMS])}
-    temporary = PINS_FILE.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, PINS_FILE)
+    with exclusive_lock(PINS_LOCK_FILE):
+        write_text_atomic(
+            PINS_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        )
 
 
 def resolve_desktop_entry(app_id):
@@ -280,6 +408,24 @@ def read_pid():
         return None
 
 
+def acquire_instance_lock():
+    PID_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = PID_LOCK_FILE.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def release_instance_lock(handle):
+    if handle is None:
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
 def process_alive(pid):
     if not pid:
         return False
@@ -297,7 +443,7 @@ def process_alive(pid):
     return "villode-dock" in cmdline
 
 
-def stop_running():
+def _stop_running():
     pid = read_pid()
     if not process_alive(pid):
         PID_FILE.unlink(missing_ok=True)
@@ -323,7 +469,12 @@ def stop_running():
     return True
 
 
-def start_daemon():
+def stop_running():
+    with exclusive_lock(OPERATION_LOCK_FILE):
+        return _stop_running()
+
+
+def _start_daemon():
     pid = read_pid()
     if process_alive(pid):
         return pid
@@ -337,7 +488,27 @@ def start_daemon():
         start_new_session=True,
         close_fds=True,
     )
+    write_text_atomic(PID_FILE, f"{process.pid}\n")
     return process.pid
+
+
+def start_daemon():
+    with exclusive_lock(OPERATION_LOCK_FILE):
+        return _start_daemon()
+
+
+def restart_daemon():
+    with exclusive_lock(OPERATION_LOCK_FILE):
+        _stop_running()
+        return _start_daemon()
+
+
+def toggle_daemon():
+    with exclusive_lock(OPERATION_LOCK_FILE):
+        if process_alive(read_pid()):
+            _stop_running()
+            return None
+        return _start_daemon()
 
 
 def spawn_command(command):
@@ -355,35 +526,107 @@ def spawn_command(command):
     return True
 
 
+def hypr_json(command, timeout=0.7):
+    try:
+        result = subprocess.run(
+            ["hyprctl", command, "-j"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
+
 def hypr_clients():
-    try:
-        result = subprocess.run(
-            ["hyprctl", "clients", "-j"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=0.7,
-        )
-        clients = json.loads(result.stdout) if result.returncode == 0 else []
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return []
-    return clients if isinstance(clients, list) else []
+    clients = hypr_json("clients")
+    return clients if isinstance(clients, list) else None
 
 
-def hypr_active_workspace_fullscreen():
-    """Return whether the focused monitor's active workspace is fullscreen."""
+def monitor_logical_geometry(monitor):
     try:
-        result = subprocess.run(
-            ["hyprctl", "activeworkspace", "-j"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=0.7,
+        scale = max(0.1, float(monitor.get("scale", 1.0)))
+        width = float(monitor["width"]) / scale
+        height = float(monitor["height"]) / scale
+        if int(monitor.get("transform", 0)) % 2:
+            width, height = height, width
+        return (
+            float(monitor["x"]),
+            float(monitor["y"]),
+            width,
+            height,
         )
-        workspace = json.loads(result.stdout) if result.returncode == 0 else {}
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def rectangle_overlap(first, second):
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[0] + first[2], second[0] + second[2])
+    bottom = min(first[1] + first[3], second[1] + second[3])
+    return max(0.0, right - left) * max(0.0, bottom - top)
+
+
+def hypr_monitor_fullscreen(monitor_geometry, clients=None):
+    """Return fullscreen state for the monitor carrying this Dock, or None."""
+    monitors = hypr_json("monitors")
+    if not isinstance(monitors, list) or not monitors:
+        return None
+
+    monitor = None
+    if monitor_geometry is not None:
+        candidates = [
+            (rectangle_overlap(monitor_geometry, geometry), item)
+            for item in monitors
+            if (geometry := monitor_logical_geometry(item)) is not None
+        ]
+        if candidates:
+            overlap, candidate = max(candidates, key=lambda pair: pair[0])
+            if overlap > 0:
+                monitor = candidate
+    if monitor is None and monitor_geometry is None:
+        monitor = next((item for item in monitors if item.get("focused")), monitors[0])
+    if monitor is None:
+        return None
+
+    active = monitor.get("specialWorkspace")
+    if not isinstance(active, dict) or not active.get("id"):
+        active = monitor.get("activeWorkspace")
+    if not isinstance(active, dict):
+        return None
+    workspace_id = active.get("id")
+    workspace_name = str(active.get("name", ""))
+
+    workspaces = hypr_json("workspaces")
+    if isinstance(workspaces, list):
+        workspace = next(
+            (
+                item
+                for item in workspaces
+                if item.get("id") == workspace_id
+                or (workspace_name and str(item.get("name", "")) == workspace_name)
+            ),
+            None,
+        )
+        if isinstance(workspace, dict) and "hasfullscreen" in workspace:
+            return bool(workspace.get("hasfullscreen"))
+
+    if isinstance(clients, list):
+        for client in clients:
+            workspace = client.get("workspace", {})
+            same_workspace = isinstance(workspace, dict) and (
+                workspace.get("id") == workspace_id
+                or (workspace_name and str(workspace.get("name", "")) == workspace_name)
+            )
+            if same_workspace and client.get("fullscreen") not in (0, False, None):
+                return True
         return False
-    return bool(workspace.get("hasfullscreen")) if isinstance(workspace, dict) else False
+    return None
 
 
 def hypr_reserved_bottom():
@@ -406,6 +649,14 @@ def hypr_reserved_bottom():
     except (OSError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError):
         pass
     return 0
+
+
+def hypr_focused_monitor_geometry():
+    monitors = hypr_json("monitors")
+    if not isinstance(monitors, list) or not monitors:
+        return None
+    monitor = next((item for item in monitors if item.get("focused")), monitors[0])
+    return monitor_logical_geometry(monitor)
 
 
 def run_dock():
@@ -471,13 +722,15 @@ def run_dock():
         cr.close_path()
 
     class DockScene(Gtk.DrawingArea):
-        def __init__(self, host_window, reserve_window=None):
+        def __init__(self, host_window, reserve_window=None, edge_window=None):
             super().__init__()
             self.host_window = host_window
             self.reserve_window = reserve_window
+            self.edge_window = edge_window
             self.fullscreen_hidden = False
             self.fullscreen_revealed = False
-            self.fullscreen_poll_id = None
+            self.fullscreen_hide_id = None
+            self.monitor_geometry = None
             self.set_can_focus(False)
             self.add_events(
                 Gdk.EventMask.POINTER_MOTION_MASK
@@ -505,6 +758,7 @@ def run_dock():
             self.clients = []
             self.trash_full = False
             self.refresh_in_flight = False
+            self.refresh_pending = False
             self.external_drag_active = False
             self.external_drop_index = None
             self.external_previous_drop_index = None
@@ -604,7 +858,11 @@ def run_dock():
                         label,
                         asset_name,
                         fallback_icon,
-                        match_patterns=RUNNING_CLASSES.get(action, ()),
+                        match_patterns=(
+                            file_manager_patterns()
+                            if action == "files"
+                            else RUNNING_CLASSES.get(action, ())
+                        ),
                         removable=action not in {"files", "launcher"},
                     )
                 elif key.startswith("desktop:"):
@@ -656,7 +914,7 @@ def run_dock():
                         label,
                         asset_name,
                         fallback_icon,
-                        match_patterns=RUNNING_CLASSES["files"],
+                        match_patterns=file_manager_patterns(),
                     ),
                 )
                 clean_keys.insert(0, "builtin:files")
@@ -696,7 +954,14 @@ def run_dock():
                 + 2 * PANEL_PADDING
             )
             display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() if display is not None else None
+            gdk_window = self.host_window.get_window()
+            monitor = (
+                display.get_monitor_at_window(gdk_window)
+                if display is not None and gdk_window is not None
+                else None
+            )
+            if monitor is None and display is not None:
+                monitor = display.get_primary_monitor()
             if monitor is None and display is not None and display.get_n_monitors() > 0:
                 monitor = display.get_monitor(0)
             monitor_width = (
@@ -721,6 +986,8 @@ def run_dock():
                 self.set_size_request(self.surface_width, WINDOW_HEIGHT)
                 self.host_window.resize(self.surface_width, WINDOW_HEIGHT)
                 self.host_window.queue_resize()
+                if self.edge_window is not None:
+                    self.edge_window.resize(self.surface_width, 2)
                 self.ensure_tick()
                 self.queue_draw()
 
@@ -1346,6 +1613,7 @@ def run_dock():
                 window.set_cursor(Gdk.Cursor.new_from_name(window.get_display(), cursor_name))
 
         def on_enter(self, _widget, event):
+            self.cancel_fullscreen_hide()
             self.pointer_inside = True
             self.pointer_x, self.pointer_y = event.x, event.y
             self.set_hovered(self.hit_test(event.x, event.y))
@@ -1390,7 +1658,49 @@ def run_dock():
             self.internal_remove_armed = False
             self.set_hovered(None)
             self.update_targets()
+            self.schedule_fullscreen_hide()
             return True
+
+        def cancel_fullscreen_hide(self):
+            if self.fullscreen_hide_id is not None:
+                GLib.source_remove(self.fullscreen_hide_id)
+                self.fullscreen_hide_id = None
+
+        def schedule_fullscreen_hide(self):
+            if (
+                self.fullscreen_hidden
+                and self.fullscreen_revealed
+                and not self.external_drag_active
+                and not self.internal_drag_active
+                and self.fullscreen_hide_id is None
+            ):
+                self.fullscreen_hide_id = GLib.timeout_add(
+                    140, self.finish_fullscreen_hide
+                )
+
+        def finish_fullscreen_hide(self):
+            self.fullscreen_hide_id = None
+            if (
+                self.fullscreen_hidden
+                and not self.pointer_inside
+                and not self.external_drag_active
+                and not self.internal_drag_active
+            ):
+                self.fullscreen_revealed = False
+                self.host_window.hide()
+                if self.edge_window is not None:
+                    self.edge_window.show_all()
+            return GLib.SOURCE_REMOVE
+
+        def reveal_fullscreen(self, *_args):
+            if not self.fullscreen_hidden or self.fullscreen_revealed:
+                return False
+            self.cancel_fullscreen_hide()
+            self.fullscreen_revealed = True
+            if self.edge_window is not None:
+                self.edge_window.hide()
+            self.host_window.show_all()
+            return False
 
         def on_button_press(self, _widget, event):
             index = self.hit_test(event.x, event.y)
@@ -1703,10 +2013,29 @@ def run_dock():
 
         def request_state_refresh(self):
             if self.refresh_in_flight:
+                self.refresh_pending = True
                 return True
+            self.update_monitor_geometry()
             self.refresh_in_flight = True
+            self.refresh_pending = False
             threading.Thread(target=self.state_refresh_worker, daemon=True).start()
             return True
+
+        def update_monitor_geometry(self):
+            display = self.host_window.get_display()
+            gdk_window = self.host_window.get_window()
+            if display is None or gdk_window is None:
+                return
+            monitor = display.get_monitor_at_window(gdk_window)
+            if monitor is None:
+                return
+            geometry = monitor.get_geometry()
+            self.monitor_geometry = (
+                float(geometry.x),
+                float(geometry.y),
+                float(geometry.width),
+                float(geometry.height),
+            )
 
         def request_state_refresh_once(self):
             self.request_state_refresh()
@@ -1764,22 +2093,33 @@ def run_dock():
 
         def state_refresh_worker(self):
             clients = hypr_clients()
-            fullscreen = hypr_active_workspace_fullscreen()
+            fullscreen = hypr_monitor_fullscreen(self.monitor_geometry, clients)
+            files_patterns = file_manager_patterns()
             trash_path = Path.home() / ".local" / "share" / "Trash" / "files"
             try:
                 trash_full = any(trash_path.iterdir())
             except (FileNotFoundError, PermissionError, OSError):
                 trash_full = False
             GLib.idle_add(
-                self.apply_refreshed_state, clients, trash_full, fullscreen
+                self.apply_refreshed_state,
+                clients,
+                trash_full,
+                fullscreen,
+                files_patterns,
             )
 
-        def apply_refreshed_state(self, clients, trash_full, fullscreen):
+        def apply_refreshed_state(
+            self, clients, trash_full, fullscreen, files_patterns
+        ):
             self.refresh_in_flight = False
-            self.clients = clients
-            self.set_fullscreen_hidden(fullscreen)
+            if clients is not None:
+                self.clients = clients
+            if fullscreen is not None:
+                self.set_fullscreen_hidden(fullscreen)
             changed = False
             for item in self.items:
+                if item["action"] == "files":
+                    item["match_patterns"] = tuple(files_patterns)
                 running = bool(item["match_patterns"]) and any(
                     self.item_matches_client(item, client) for client in self.clients
                 )
@@ -1792,6 +2132,9 @@ def run_dock():
 
             if changed:
                 self.queue_draw()
+            if self.refresh_pending:
+                self.refresh_pending = False
+                self.request_state_refresh()
             return False
 
         def set_fullscreen_hidden(self, hidden):
@@ -1800,72 +2143,21 @@ def run_dock():
                 return
             self.fullscreen_hidden = hidden
             if hidden:
+                self.cancel_fullscreen_hide()
                 self.fullscreen_revealed = False
                 self.host_window.hide()
                 if self.reserve_window is not None:
                     self.reserve_window.hide()
-                if self.fullscreen_poll_id is None:
-                    self.fullscreen_poll_id = GLib.timeout_add(
-                        120, self.poll_fullscreen_pointer
-                    )
+                if self.edge_window is not None:
+                    self.edge_window.show_all()
             else:
+                self.cancel_fullscreen_hide()
                 self.fullscreen_revealed = False
-                self.fullscreen_poll_id = None
+                if self.edge_window is not None:
+                    self.edge_window.hide()
                 if self.reserve_window is not None:
                     self.reserve_window.show_all()
                 self.host_window.show_all()
-
-        def poll_fullscreen_pointer(self):
-            if not self.fullscreen_hidden:
-                self.fullscreen_poll_id = None
-                return GLib.SOURCE_REMOVE
-            display = self.host_window.get_display()
-            if display is None:
-                return GLib.SOURCE_CONTINUE
-            try:
-                result = subprocess.run(
-                    ["hyprctl", "cursorpos", "-j"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=0.25,
-                )
-                position = json.loads(result.stdout) if result.returncode == 0 else {}
-                pointer_x = int(position["x"])
-                pointer_y = int(position["y"])
-            except (
-                OSError,
-                KeyError,
-                TypeError,
-                ValueError,
-                subprocess.TimeoutExpired,
-                json.JSONDecodeError,
-            ):
-                return GLib.SOURCE_CONTINUE
-            monitor = display.get_monitor_at_point(pointer_x, pointer_y)
-            if monitor is None:
-                return GLib.SOURCE_CONTINUE
-            geometry = monitor.get_geometry()
-            dock_left = geometry.x + (geometry.width - self.surface_width) / 2.0
-            dock_top = geometry.y + geometry.height - WINDOW_HEIGHT
-            pointer_over_dock = (
-                dock_left <= pointer_x < dock_left + self.surface_width
-                and dock_top <= pointer_y < geometry.y + geometry.height
-            )
-            pointer_at_edge = pointer_y >= geometry.y + geometry.height - 2
-
-            if not self.fullscreen_revealed and pointer_at_edge:
-                self.fullscreen_revealed = True
-                self.host_window.show_all()
-            elif (
-                self.fullscreen_revealed
-                and not pointer_over_dock
-                and not self.external_drag_active
-                and not self.internal_drag_active
-            ):
-                self.fullscreen_revealed = False
-                self.host_window.hide()
-            return GLib.SOURCE_CONTINUE
 
         def apply_trash_state(self, trash_full):
             self.trash_full = bool(trash_full)
@@ -2091,6 +2383,13 @@ def run_dock():
     existing_bottom = hypr_reserved_bottom()
     strut_zone = max(0, EXCLUSIVE_ZONE - existing_bottom)
     strut_window = None
+
+    def draw_clear_surface(_widget, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+        cr.paint()
+        return False
+
     if strut_zone > 0:
         strut_window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         strut_window.set_title("Villode Dock Reservation")
@@ -2105,12 +2404,6 @@ def run_dock():
         visual = screen.get_rgba_visual()
         if visual is not None:
             strut_window.set_visual(visual)
-
-        def draw_clear_surface(_widget, cr):
-            cr.set_operator(cairo.OPERATOR_SOURCE)
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0)
-            cr.paint()
-            return False
 
         def remove_strut_input(widget):
             gdk_window = widget.get_window()
@@ -2156,15 +2449,53 @@ def run_dock():
     # exactly the panel height, without moving this visible overlay.
     GtkLayerShell.set_exclusive_zone(window, -1)
 
-    scene = DockScene(window, strut_window)
+    edge_window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    edge_window.set_title("Villode Dock Edge")
+    edge_window.set_name("villode-dock-edge")
+    edge_window.set_decorated(False)
+    edge_window.set_resizable(False)
+    edge_window.set_accept_focus(False)
+    edge_window.set_app_paintable(True)
+    edge_window.set_default_size(SURFACE_WIDTH, 2)
+    edge_window.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK)
+    edge_visual = edge_window.get_screen().get_rgba_visual()
+    if edge_visual is not None:
+        edge_window.set_visual(edge_visual)
+    edge_window.connect("draw", draw_clear_surface)
+    GtkLayerShell.init_for_window(edge_window)
+    GtkLayerShell.set_namespace(edge_window, "villode-dock-edge")
+    GtkLayerShell.set_layer(edge_window, GtkLayerShell.Layer.OVERLAY)
+    GtkLayerShell.set_keyboard_mode(edge_window, GtkLayerShell.KeyboardMode.NONE)
+    GtkLayerShell.set_anchor(edge_window, GtkLayerShell.Edge.BOTTOM, True)
+    GtkLayerShell.set_exclusive_zone(edge_window, -1)
+
+    display = window.get_display()
+    focused_geometry = hypr_focused_monitor_geometry()
+    target_monitor = None
+    if display is not None and focused_geometry is not None:
+        target_monitor = display.get_monitor_at_point(
+            int(focused_geometry[0] + focused_geometry[2] / 2),
+            int(focused_geometry[1] + focused_geometry[3] / 2),
+        )
+    if target_monitor is not None:
+        GtkLayerShell.set_monitor(window, target_monitor)
+        GtkLayerShell.set_monitor(edge_window, target_monitor)
+        if strut_window is not None:
+            GtkLayerShell.set_monitor(strut_window, target_monitor)
+
+    scene = DockScene(window, strut_window, edge_window)
     window.set_default_size(scene.surface_width, WINDOW_HEIGHT)
+    edge_window.set_default_size(scene.surface_width, 2)
+    edge_window.set_size_request(scene.surface_width, 2)
     window.add(scene)
     window.connect("destroy", Gtk.main_quit)
+    edge_window.connect("enter-notify-event", scene.reveal_fullscreen)
 
     control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     DOCK_CONTROL_SOCKET.parent.mkdir(parents=True, exist_ok=True)
     DOCK_CONTROL_SOCKET.unlink(missing_ok=True)
     control_socket.bind(str(DOCK_CONTROL_SOCKET))
+    os.chmod(DOCK_CONTROL_SOCKET, 0o600)
     control_socket.setblocking(False)
 
     def receive_control_event(_source, condition):
@@ -2271,29 +2602,26 @@ def main():
         stop_running()
         return 0
     if args.reload:
-        stop_running()
-        start_daemon()
+        restart_daemon()
         return 0
     if args.toggle:
-        if process_alive(read_pid()):
-            stop_running()
-        else:
-            start_daemon()
+        toggle_daemon()
         return 0
     if args.daemon or not args.run:
         start_daemon()
         return 0
 
-    existing = read_pid()
-    if process_alive(existing) and existing != os.getpid():
+    instance_lock = acquire_instance_lock()
+    if instance_lock is None:
         return 0
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
+    write_text_atomic(PID_FILE, f"{os.getpid()}\n")
     try:
         return run_dock()
     finally:
         if read_pid() == os.getpid():
             PID_FILE.unlink(missing_ok=True)
+        release_instance_lock(instance_lock)
 
 
 if __name__ == "__main__":
