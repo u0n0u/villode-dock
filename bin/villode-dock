@@ -25,6 +25,7 @@ ICON_DIR = Path.home() / ".local" / "share" / "villode-dock" / "icons"
 ICON_CREDITS = ICON_DIR / "CREDITS.md"
 CONFIG_DIR = Path.home() / ".config" / "villode-dock"
 PINS_FILE = CONFIG_DIR / "pins.json"
+CAELESTIA_CONFIG = Path.home() / ".config" / "caelestia" / "shell.json"
 DOCK_CONTROL_SOCKET = Path.home() / ".cache" / "villode-dock-control.sock"
 DOCK_APP_MIME = "application/x-villode-dock-app+json"
 APP_DIRS = (
@@ -37,13 +38,9 @@ if not DOWNLOAD_DIR.is_dir():
     DOWNLOAD_DIR = Path.home() / "Downloads"
 
 ACTIONS = {
-    "files": ["nautilus", "--new-window"],
     "launcher": ["villode-launcher"],
     "terminal": ["alacritty"],
     "browser": ["google-chrome-stable"],
-    "desktop-settings": ["villode-desktop", "--configure"],
-    "downloads": ["nautilus", str(DOWNLOAD_DIR)],
-    "trash": ["nautilus", "trash:///"],
 }
 
 BUILTIN_ITEMS = {
@@ -51,11 +48,6 @@ BUILTIN_ITEMS = {
     "launcher": ("启动台", "launchpad.png", "applications-all"),
     "terminal": ("终端", "terminal.png", "Alacritty"),
     "browser": ("浏览器", "chrome.png", "google-chrome"),
-    "desktop-settings": (
-        "桌面设置",
-        "settings.png",
-        "preferences-desktop-wallpaper",
-    ),
 }
 PLACE_ITEMS = (
     ("downloads", "下载", "downloads.png", "folder-download"),
@@ -66,7 +58,6 @@ DEFAULT_PINNED_KEYS = [
     "builtin:launcher",
     "builtin:terminal",
     "builtin:browser",
-    "builtin:desktop-settings",
 ]
 BUILTIN_DESKTOP_IDS = {
     "org.gnome.nautilus.desktop": "files",
@@ -74,19 +65,54 @@ BUILTIN_DESKTOP_IDS = {
     "alacritty.desktop": "terminal",
     "google-chrome.desktop": "browser",
     "com.google.chrome.desktop": "browser",
-    "villode-desktop.desktop": "desktop-settings",
 }
 MAX_PINNED_ITEMS = 20
 
 # These are window classes, not process names.  In particular, the launcher has
 # a background daemon which must not count as a visible/running Dock item.
 RUNNING_CLASSES = {
-    "files": ("org.gnome.nautilus", "nautilus"),
+    "files": (
+        "org.gnome.nautilus",
+        "nautilus",
+        "org.kde.dolphin",
+        "dolphin",
+        "thunar",
+        "nemo",
+        "pcmanfm",
+        "pcmanfm-qt",
+    ),
     "launcher": ("local.villode.launcher",),
     "terminal": ("alacritty",),
     "browser": ("google-chrome", "google-chrome-stable"),
 }
 FOCUSABLE = frozenset(RUNNING_CLASSES)
+
+
+def caelestia_explorer_command():
+    """Read Caelestia's current file manager command on every activation."""
+    try:
+        payload = json.loads(CAELESTIA_CONFIG.read_text(encoding="utf-8"))
+        command = payload["general"]["apps"]["explorer"]
+    except (FileNotFoundError, OSError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(command, list) or not command:
+        return None
+    command = [str(part) for part in command if str(part)]
+    if not command:
+        return None
+    executable = command[0]
+    if shutil.which(executable) is None and not (
+        Path(executable).is_file() and os.access(executable, os.X_OK)
+    ):
+        return None
+    return command
+
+
+def file_manager_command(target):
+    command = caelestia_explorer_command()
+    if command is None:
+        return ["xdg-open", str(target)]
+    return [*command, str(target)]
 
 
 def valid_desktop_id(value):
@@ -565,9 +591,6 @@ def run_dock():
                     if (
                         action == "launcher"
                         and shutil.which("villode-launcher") is None
-                    ) or (
-                        action == "desktop-settings"
-                        and shutil.which("villode-desktop") is None
                     ):
                         continue
                     spec = BUILTIN_ITEMS.get(action)
@@ -1460,6 +1483,12 @@ def run_dock():
                     return
             if item["kind"] == "desktop":
                 command = ["gtk-launch", item["desktop_id"]]
+            elif item["action"] == "files":
+                command = file_manager_command(Path.home())
+            elif item["action"] == "downloads":
+                command = file_manager_command(DOWNLOAD_DIR)
+            elif item["action"] == "trash":
+                command = file_manager_command("trash:///")
             else:
                 command = ACTIONS[item["action"]]
             if spawn_command(command):
@@ -1657,19 +1686,6 @@ def run_dock():
                     )
                 menu.append(Gtk.SeparatorMenuItem())
 
-            menu.append(
-                self.menu_item(
-                    "桌面设置…",
-                    lambda _item: spawn_command(ACTIONS["desktop-settings"]),
-                )
-            )
-            menu.append(
-                self.menu_item(
-                    "刷新桌面",
-                    lambda _item: spawn_command(["villode-desktop", "--reload"]),
-                )
-            )
-            menu.append(Gtk.SeparatorMenuItem())
             menu.append(
                 self.menu_item(
                     "重新载入 Dock",
