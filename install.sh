@@ -90,14 +90,16 @@ EOF
 
   mkdir -p "$HYPR_DIR"
   touch "$HYPR_MAIN"
-  if grep -Eq 'source *=.*villode-dock\.conf' "$HYPR_MAIN"; then
-    return
-  fi
-  if grep -Eq 'villode-dock --daemon|match:namespace villode-dock|\$dock *= *villode-dock' "$HYPR_MAIN"; then
-    echo "Hyprland already contains Villode Dock entries; not appending a source line."
-    echo "Fresh Dock config was still written to: $HYPR_INCLUDE"
-    return
-  fi
+  # Migrate releases which wrote the Dock block directly into hyprland.conf.
+  # The include becomes the single managed source, so upgrades stay idempotent.
+  sed -i.bak \
+    -e '/^[[:space:]]*#[[:space:]]*Villode Dock[[:space:]]*$/d' \
+    -e '/villode-dock\.conf/d' \
+    -e '/^[[:space:]]*\$dock[[:space:]]*=[[:space:]]*villode-dock[[:space:]]*$/d' \
+    -e '/^[[:space:]]*exec-once[[:space:]]*=.*villode-dock/d' \
+    -e '/^[[:space:]]*exec-once[[:space:]]*=.*\$dock/d' \
+    -e '/^[[:space:]]*layerrule[[:space:]]*=.*villode-dock/d' \
+    "$HYPR_MAIN"
   {
     echo
     echo "# Villode Dock"
