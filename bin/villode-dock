@@ -344,6 +344,22 @@ def hypr_clients():
     return clients if isinstance(clients, list) else []
 
 
+def hypr_active_workspace_fullscreen():
+    """Return whether the focused monitor's active workspace is fullscreen."""
+    try:
+        result = subprocess.run(
+            ["hyprctl", "activeworkspace", "-j"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=0.7,
+        )
+        workspace = json.loads(result.stdout) if result.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return False
+    return bool(workspace.get("hasfullscreen")) if isinstance(workspace, dict) else False
+
+
 def hypr_reserved_bottom():
     """Return the reservation that existed before this Dock was mapped."""
     try:
@@ -427,9 +443,13 @@ def run_dock():
         cr.close_path()
 
     class DockScene(Gtk.DrawingArea):
-        def __init__(self, host_window):
+        def __init__(self, host_window, reserve_window=None):
             super().__init__()
             self.host_window = host_window
+            self.reserve_window = reserve_window
+            self.fullscreen_hidden = False
+            self.fullscreen_revealed = False
+            self.fullscreen_poll_id = None
             self.set_can_focus(False)
             self.add_events(
                 Gdk.EventMask.POINTER_MOTION_MASK
@@ -1648,7 +1668,19 @@ def run_dock():
                             stream.connect(str(event_socket))
                             with stream.makefile("r", encoding="utf-8", errors="replace") as events:
                                 for line in events:
-                                    if line.startswith(("openwindow>>", "closewindow>>")):
+                                    if line.startswith(
+                                        (
+                                            "openwindow>>",
+                                            "closewindow>>",
+                                            "fullscreen>>",
+                                            "fullscreenstate>>",
+                                            "workspace>>",
+                                            "workspacev2>>",
+                                            "focusedmon>>",
+                                            "activewindow>>",
+                                            "activewindowv2>>",
+                                        )
+                                    ):
                                         GLib.idle_add(self.request_state_refresh_once)
                     except OSError:
                         time.sleep(2.0)
@@ -1672,16 +1704,20 @@ def run_dock():
 
         def state_refresh_worker(self):
             clients = hypr_clients()
+            fullscreen = hypr_active_workspace_fullscreen()
             trash_path = Path.home() / ".local" / "share" / "Trash" / "files"
             try:
                 trash_full = any(trash_path.iterdir())
             except (FileNotFoundError, PermissionError, OSError):
                 trash_full = False
-            GLib.idle_add(self.apply_refreshed_state, clients, trash_full)
+            GLib.idle_add(
+                self.apply_refreshed_state, clients, trash_full, fullscreen
+            )
 
-        def apply_refreshed_state(self, clients, trash_full):
+        def apply_refreshed_state(self, clients, trash_full, fullscreen):
             self.refresh_in_flight = False
             self.clients = clients
+            self.set_fullscreen_hidden(fullscreen)
             changed = False
             for item in self.items:
                 running = bool(item["match_patterns"]) and any(
@@ -1697,6 +1733,79 @@ def run_dock():
             if changed:
                 self.queue_draw()
             return False
+
+        def set_fullscreen_hidden(self, hidden):
+            hidden = bool(hidden)
+            if hidden == self.fullscreen_hidden:
+                return
+            self.fullscreen_hidden = hidden
+            if hidden:
+                self.fullscreen_revealed = False
+                self.host_window.hide()
+                if self.reserve_window is not None:
+                    self.reserve_window.hide()
+                if self.fullscreen_poll_id is None:
+                    self.fullscreen_poll_id = GLib.timeout_add(
+                        120, self.poll_fullscreen_pointer
+                    )
+            else:
+                self.fullscreen_revealed = False
+                self.fullscreen_poll_id = None
+                if self.reserve_window is not None:
+                    self.reserve_window.show_all()
+                self.host_window.show_all()
+
+        def poll_fullscreen_pointer(self):
+            if not self.fullscreen_hidden:
+                self.fullscreen_poll_id = None
+                return GLib.SOURCE_REMOVE
+            display = self.host_window.get_display()
+            if display is None:
+                return GLib.SOURCE_CONTINUE
+            try:
+                result = subprocess.run(
+                    ["hyprctl", "cursorpos", "-j"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=0.25,
+                )
+                position = json.loads(result.stdout) if result.returncode == 0 else {}
+                pointer_x = int(position["x"])
+                pointer_y = int(position["y"])
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+                subprocess.TimeoutExpired,
+                json.JSONDecodeError,
+            ):
+                return GLib.SOURCE_CONTINUE
+            monitor = display.get_monitor_at_point(pointer_x, pointer_y)
+            if monitor is None:
+                return GLib.SOURCE_CONTINUE
+            geometry = monitor.get_geometry()
+            dock_left = geometry.x + (geometry.width - self.surface_width) / 2.0
+            dock_top = geometry.y + geometry.height - WINDOW_HEIGHT
+            pointer_over_dock = (
+                dock_left <= pointer_x < dock_left + self.surface_width
+                and dock_top <= pointer_y < geometry.y + geometry.height
+            )
+            pointer_at_edge = pointer_y >= geometry.y + geometry.height - 2
+
+            if not self.fullscreen_revealed and pointer_at_edge:
+                self.fullscreen_revealed = True
+                self.host_window.show_all()
+            elif (
+                self.fullscreen_revealed
+                and not pointer_over_dock
+                and not self.external_drag_active
+                and not self.internal_drag_active
+            ):
+                self.fullscreen_revealed = False
+                self.host_window.hide()
+            return GLib.SOURCE_CONTINUE
 
         def apply_trash_state(self, trash_full):
             self.trash_full = bool(trash_full)
@@ -1987,7 +2096,7 @@ def run_dock():
     # exactly the panel height, without moving this visible overlay.
     GtkLayerShell.set_exclusive_zone(window, -1)
 
-    scene = DockScene(window)
+    scene = DockScene(window, strut_window)
     window.set_default_size(scene.surface_width, WINDOW_HEIGHT)
     window.add(scene)
     window.connect("destroy", Gtk.main_quit)
@@ -2064,6 +2173,7 @@ def run_dock():
     if strut_window is not None:
         strut_window.show_all()
     window.show_all()
+    GLib.idle_add(scene.request_state_refresh_once)
     try:
         Gtk.main()
     finally:
