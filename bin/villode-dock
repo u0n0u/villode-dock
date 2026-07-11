@@ -424,6 +424,8 @@ def run_dock():
     EXTERNAL_DROP_GAP = 48
     EXTERNAL_INDEX_TRANSITION = 0.12
     EXTERNAL_INDEX_HYSTERESIS = 7.0
+    LAYOUT_SPRING = 235.0
+    LAYOUT_DAMPING = 20.0
     REMOVE_ARM_Y = PANEL_TOP - 18.0
     REMOVE_DISARM_Y = PANEL_TOP - 7.0
     MAX_SCALE = 1.50
@@ -546,6 +548,9 @@ def run_dock():
                 "scale": 1.0,
                 "target": 1.0,
                 "velocity": 0.0,
+                "layout_x": None,
+                "layout_target_x": None,
+                "layout_velocity": 0.0,
                 "running": False,
                 "bounce_start": None,
             }
@@ -607,6 +612,9 @@ def run_dock():
                         "scale",
                         "target",
                         "velocity",
+                        "layout_x",
+                        "layout_target_x",
+                        "layout_velocity",
                         "running",
                         "bounce_start",
                     ):
@@ -647,6 +655,9 @@ def run_dock():
                         "scale",
                         "target",
                         "velocity",
+                        "layout_x",
+                        "layout_target_x",
+                        "layout_velocity",
                         "running",
                         "bounce_start",
                     ):
@@ -921,6 +932,25 @@ def run_dock():
                     entry["slot_right"] += shift
                     entry["icon_x"] += shift
 
+            # Slot changes during an internal reorder are discrete, but the
+            # neighbouring icons should glide into those slots.  Keep the
+            # dragged icon directly under the pointer and spring every other
+            # icon towards its newly computed centre.
+            for entry, item in zip(entries, self.items):
+                target_x = entry["center_x"]
+                item["layout_target_x"] = target_x
+                if internal_drag and entry["index"] == dragged_index:
+                    item["layout_x"] = target_x
+                    item["layout_velocity"] = 0.0
+                    continue
+                if item["layout_x"] is None:
+                    item["layout_x"] = target_x
+                delta = item["layout_x"] - target_x
+                entry["center_x"] += delta
+                entry["slot_left"] += delta
+                entry["slot_right"] += delta
+                entry["icon_x"] += delta
+
             return {
                 "panel_left": panel_left,
                 "panel_width": panel_width,
@@ -1002,6 +1032,20 @@ def run_dock():
                         moving = True
                     else:
                         item["bounce_start"] = None
+
+                if item["layout_target_x"] is not None:
+                    layout_error = item["layout_target_x"] - item["layout_x"]
+                    item["layout_velocity"] += layout_error * LAYOUT_SPRING * dt
+                    item["layout_velocity"] *= math.exp(-LAYOUT_DAMPING * dt)
+                    item["layout_x"] += item["layout_velocity"] * dt
+                    if (
+                        abs(layout_error) < 0.03
+                        and abs(item["layout_velocity"]) < 0.08
+                    ):
+                        item["layout_x"] = item["layout_target_x"]
+                        item["layout_velocity"] = 0.0
+                    else:
+                        moving = True
 
             self.layout = self.compute_layout(now)
             if self.pointer_inside and self.pressed is None:
