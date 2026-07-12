@@ -45,8 +45,6 @@ if not DOWNLOAD_DIR.is_dir():
 
 ACTIONS = {
     "launcher": ["villode-launcher"],
-    "terminal": ["alacritty"],
-    "browser": ["google-chrome-stable"],
 }
 
 BUILTIN_ITEMS = {
@@ -88,10 +86,79 @@ RUNNING_CLASSES = {
         "pcmanfm-qt",
     ),
     "launcher": ("local.villode.launcher",),
-    "terminal": ("alacritty",),
+    "terminal": ("alacritty", "foot", "kitty", "org.wezfurlong.wezterm", "konsole"),
     "browser": ("google-chrome", "google-chrome-stable"),
 }
 FOCUSABLE = frozenset(RUNNING_CLASSES)
+
+
+def terminal_command():
+    """Return the terminal selected in Caelestia's default-app settings."""
+    try:
+        data = json.loads(CAELESTIA_CONFIG.read_text())
+        command = data["general"]["apps"]["terminal"]
+        if (
+            isinstance(command, list)
+            and command
+            and all(isinstance(argument, str) and argument for argument in command)
+            and shutil.which(command[0])
+        ):
+            return command
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    for candidate in ("alacritty", "foot", "kitty", "xterm"):
+        if shutil.which(candidate):
+            return [candidate]
+    return ["alacritty"]
+
+
+def terminal_window_classes(command):
+    name = Path(command[0]).name if command else ""
+    return {
+        "alacritty": ("alacritty",),
+        "foot": ("foot",),
+        "kitty": ("kitty",),
+        "wezterm": ("org.wezfurlong.wezterm", "wezterm"),
+        "konsole": ("org.kde.konsole", "konsole"),
+        "gnome-terminal": ("org.gnome.terminal", "gnome-terminal-server"),
+        "kgx": ("org.gnome.console", "kgx"),
+        "xfce4-terminal": ("xfce4-terminal",),
+        "xterm": ("xterm",),
+    }.get(name, (name.lower(),))
+
+
+def browser_command():
+    try:
+        data = json.loads(CAELESTIA_CONFIG.read_text())
+        command = data["general"]["apps"]["browser"]
+        if (
+            isinstance(command, list)
+            and command
+            and all(isinstance(argument, str) and argument for argument in command)
+            and shutil.which(command[0])
+        ):
+            return command
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    for candidate in ("google-chrome-stable", "chromium", "firefox"):
+        if shutil.which(candidate):
+            return [candidate]
+    return ["xdg-open", "about:blank"]
+
+
+def browser_window_classes(command):
+    name = Path(command[0]).name if command else ""
+    return {
+        "google-chrome-stable": ("google-chrome", "google-chrome-stable"),
+        "google-chrome": ("google-chrome",),
+        "chromium": ("chromium",),
+        "firefox": ("firefox",),
+        "brave": ("brave-browser", "brave"),
+        "brave-browser": ("brave-browser", "brave"),
+        "microsoft-edge-stable": ("microsoft-edge", "microsoft-edge-stable"),
+    }.get(name, (name.lower(),))
 
 
 @contextmanager
@@ -1766,9 +1833,14 @@ def run_dock():
                 str(client.get("class", "")).lower(),
                 str(client.get("initialClass", "")).lower(),
             )
+            patterns = item["match_patterns"]
+            if item["action"] == "terminal":
+                patterns = terminal_window_classes(terminal_command())
+            elif item["action"] == "browser":
+                patterns = browser_window_classes(browser_command())
             return any(
                 pattern and pattern == value
-                for pattern in item["match_patterns"]
+                for pattern in patterns
                 for value in values
             )
 
@@ -1799,6 +1871,10 @@ def run_dock():
                 command = file_manager_command(DOWNLOAD_DIR)
             elif item["action"] == "trash":
                 command = file_manager_command("trash:///")
+            elif item["action"] == "terminal":
+                command = terminal_command()
+            elif item["action"] == "browser":
+                command = browser_command()
             else:
                 command = ACTIONS[item["action"]]
             if spawn_command(command):

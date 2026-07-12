@@ -85,6 +85,49 @@ class DockCoreTests(unittest.TestCase):
                 ["custom-files", "--open", "trash:///"],
             )
 
+    def test_terminal_command_uses_caelestia_default(self):
+        self.module.CAELESTIA_CONFIG.parent.mkdir(parents=True)
+        self.module.CAELESTIA_CONFIG.write_text(
+            json.dumps({"general": {"apps": {"terminal": ["foot", "--server"]}}})
+        )
+        with mock.patch.object(self.module.shutil, "which", return_value="/usr/bin/foot"):
+            self.assertEqual(self.module.terminal_command(), ["foot", "--server"])
+
+    def test_terminal_command_rejects_shell_strings(self):
+        self.module.CAELESTIA_CONFIG.parent.mkdir(parents=True)
+        self.module.CAELESTIA_CONFIG.write_text(
+            json.dumps({"general": {"apps": {"terminal": "foot; unwanted"}}})
+        )
+        with mock.patch.object(
+            self.module.shutil,
+            "which",
+            side_effect=lambda command: "/usr/bin/alacritty" if command == "alacritty" else None,
+        ):
+            self.assertEqual(self.module.terminal_command(), ["alacritty"])
+
+    def test_terminal_window_classes_follow_selected_terminal(self):
+        self.assertEqual(self.module.terminal_window_classes(["foot"]), ("foot",))
+        self.assertEqual(
+            self.module.terminal_window_classes(["wezterm", "start"]),
+            ("org.wezfurlong.wezterm", "wezterm"),
+        )
+
+    def test_browser_command_uses_caelestia_default(self):
+        self.module.CAELESTIA_CONFIG.parent.mkdir(parents=True)
+        self.module.CAELESTIA_CONFIG.write_text(
+            json.dumps({"general": {"apps": {"browser": ["firefox", "--private-window"]}}})
+        )
+        with mock.patch.object(self.module.shutil, "which", return_value="/usr/bin/firefox"):
+            self.assertEqual(
+                self.module.browser_command(), ["firefox", "--private-window"]
+            )
+
+    def test_browser_window_classes_follow_selected_browser(self):
+        self.assertEqual(
+            self.module.browser_window_classes(["google-chrome-stable"]),
+            ("google-chrome", "google-chrome-stable"),
+        )
+
     def test_concurrent_pin_saves_are_atomic(self):
         children = []
         for index in range(24):
