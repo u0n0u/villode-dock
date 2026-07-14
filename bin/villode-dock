@@ -91,6 +91,24 @@ RUNNING_CLASSES = {
 }
 FOCUSABLE = frozenset(RUNNING_CLASSES)
 
+# Transient / shell surfaces that must never appear as running Dock apps.
+SKIP_RUNNING_CLASSES = frozenset(
+    {
+        "villode-dock",
+        "local.villode.dock",
+        "local.villode.launcher",
+        "quickshell",
+        "qs",
+        "xdg-desktop-portal-gtk",
+        "xdg-desktop-portal-hyprland",
+        "polkit-gnome-authentication-agent-1",
+        "nm-applet",
+    }
+)
+
+# Cache: lowercase wm class / exec name → desktop_id
+_DESKTOP_CLASS_INDEX = None
+
 
 def terminal_command():
     """Return the terminal selected in Caelestia's default-app settings."""
@@ -374,6 +392,11 @@ def resolve_desktop_entry(app_id):
         return None
     if entry.get("Type", "Application") != "Application" or not entry.get("Exec"):
         return None
+    if entry.get("NoDisplay", "").lower() in {"1", "true"} and entry.get(
+        "OnlyShowIn", ""
+    ):
+        # Keep normal apps; still allow matching via StartupWMClass below.
+        pass
     name = entry.get("Name[zh_CN]", entry.get("Name", path.stem)).strip()
     icon = entry.get("Icon", "application-x-executable").strip()
     command = re.sub(r"\s+%[fFuUdDnNickvm]", "", entry.get("Exec", "")).strip()
@@ -400,9 +423,55 @@ def resolve_desktop_entry(app_id):
     }
 
 
-def pin_desktop_at_screen_x(desktop_id, screen_x):
-    if resolve_desktop_entry(desktop_id) is None:
-        return False
+def build_desktop_class_index():
+    """Map window class / exec stem → desktop_id for running unpinned apps."""
+    index = {}
+    for directory in APP_DIRS:
+        if not directory.is_dir():
+            continue
+        try:
+            entries = list(directory.glob("*.desktop"))
+        except OSError:
+            continue
+        for path in entries:
+            app_id = path.name
+            entry = resolve_desktop_entry(app_id)
+            if entry is None:
+                continue
+            for pattern in entry["patterns"]:
+                index.setdefault(pattern, app_id)
+            # Also index the desktop stem and common variants.
+            stem = path.stem.lower()
+            index.setdefault(stem, app_id)
+            index.setdefault(stem.replace("_", "-"), app_id)
+            index.setdefault(stem.replace("-", "_"), app_id)
+    return index
+
+
+def desktop_id_for_window_class(wm_class):
+    global _DESKTOP_CLASS_INDEX
+    value = str(wm_class or "").strip().lower()
+    if not value or value in SKIP_RUNNING_CLASSES:
+        return None
+    if _DESKTOP_CLASS_INDEX is None:
+        _DESKTOP_CLASS_INDEX = build_desktop_class_index()
+    # Exact match first.
+    if value in _DESKTOP_CLASS_INDEX:
+        return _DESKTOP_CLASS_INDEX[value]
+    # Chromium-style "Google-chrome" / "org.gnome.Nautilus"
+    compact = value.replace(" ", "").replace("_", "-")
+    if compact in _DESKTOP_CLASS_INDEX:
+        return _DESKTOP_CLASS_INDEX[compact]
+    # Last segment after '.' (org.gnome.Nautilus → nautilus)
+    if "." in value:
+        tail = value.rsplit(".", 1)[-1]
+        if tail in _DESKTOP_CLASS_INDEX:
+            return _DESKTOP_CLASS_INDEX[tail]
+    return None
+
+
+def find_layer_by_namespace(namespace):
+    """Return (layer_dict, monitor_dict) for a Hyprland layer namespace, or (None, None)."""
     try:
         layers = json.loads(
             subprocess.check_output(
@@ -411,20 +480,33 @@ def pin_desktop_at_screen_x(desktop_id, screen_x):
                 timeout=0.8,
             )
         )
+        monitors = hypr_json("monitors") or []
     except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
-        return False
-
-    dock_layer = None
-    for monitor in layers.values() if isinstance(layers, dict) else []:
-        for level in monitor.get("levels", {}).values():
+        return None, None
+    if not isinstance(layers, dict):
+        return None, None
+    mon_by_name = {
+        str(m.get("name", "")): m for m in monitors if isinstance(m, dict)
+    }
+    for mon_name, monitor_layers in layers.items():
+        if not isinstance(monitor_layers, dict):
+            continue
+        levels = monitor_layers.get("levels", monitor_layers)
+        if not isinstance(levels, dict):
+            continue
+        for level in levels.values():
+            if not isinstance(level, list):
+                continue
             for layer in level:
-                if layer.get("namespace") == "villode-dock":
-                    dock_layer = layer
-                    break
-            if dock_layer is not None:
-                break
-        if dock_layer is not None:
-            break
+                if layer.get("namespace") == namespace:
+                    return layer, mon_by_name.get(str(mon_name))
+    return None, None
+
+
+def pin_desktop_at_screen_x(desktop_id, screen_x):
+    if resolve_desktop_entry(desktop_id) is None:
+        return False
+    dock_layer, _monitor = find_layer_by_namespace("villode-dock")
     if dock_layer is None:
         return False
 
@@ -775,9 +857,7 @@ def run_dock():
     MAX_SCALE = 1.50
     WAVE_RADIUS = 145.0
     TOOLTIP_DELAY = 0.28
-    BOUNCE_DURATION = 0.60
-    MIN_ANIMATION_FRAME_US = 12_000  # 72 fps on this 144 Hz panel; idle is zero fps.
-    EXCLUSIVE_ZONE = WINDOW_HEIGHT - PANEL_TOP
+
 
     def rounded_rectangle(cr, x, y, width, height, radius):
         radius = max(0.0, min(radius, width / 2.0, height / 2.0))
@@ -787,6 +867,554 @@ def run_dock():
         cr.arc(x + radius, y + height - radius, radius, math.pi / 2, math.pi)
         cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
         cr.close_path()
+
+    class GlassContextMenu:
+        """Single full-output layer: dim backdrop + glass menu panel.
+
+        One surface avoids stacking races where a dismiss layer steals clicks.
+        Clicks on a row activate it; clicks outside close the menu.
+        """
+
+        ROW_H = 36
+        PAD_X = 16
+        PAD_Y = 10
+        RADIUS = 14
+        MIN_WIDTH = 176
+        _active = None
+
+        def __init__(self, parent, entries, screen_x, screen_y):
+            self.parent = parent
+            self.entries = list(entries)
+            self.screen_x = float(screen_x)
+            self.screen_y = float(screen_y)
+            self.hover = None
+            self.window = None
+            self.area = None
+            self.panel_x = 0.0
+            self.panel_y = 0.0
+            self.width = self.MIN_WIDTH
+            self.height = self.PAD_Y * 2
+            self.mon_w = 1920.0
+            self.mon_h = 1080.0
+
+        @classmethod
+        def close_active(cls):
+            if cls._active is not None:
+                cls._active.close()
+
+        def popup(self):
+            GlassContextMenu.close_active()
+            if not self.entries:
+                return
+
+            tmp = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+            cr = cairo.Context(tmp)
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription("Sans Medium 11"))
+            max_tw = 0
+            for entry in self.entries:
+                if entry.get("separator"):
+                    continue
+                layout.set_text(entry.get("label", ""), -1)
+                tw, _th = layout.get_pixel_size()
+                max_tw = max(max_tw, tw)
+            self.width = max(self.MIN_WIDTH, int(max_tw + self.PAD_X * 2 + 8))
+            h = self.PAD_Y * 2
+            for entry in self.entries:
+                h += 9 if entry.get("separator") else self.ROW_H
+            self.height = int(h)
+
+            dock_layer, hypr_mon = find_layer_by_namespace("villode-dock")
+            if hypr_mon is not None:
+                mon_x = float(hypr_mon.get("x", 0))
+                mon_y = float(hypr_mon.get("y", 0))
+                mon_w = float(hypr_mon.get("width", 1920))
+                mon_h = float(hypr_mon.get("height", 1080))
+            else:
+                mon_x = mon_y = 0.0
+                mon_w, mon_h = 1920.0, 1080.0
+            self.mon_w, self.mon_h = mon_w, mon_h
+
+            # Absolute → output-local panel position (bottom-centered on anchor).
+            left = self.screen_x - mon_x - self.width / 2.0
+            top = self.screen_y - mon_y - self.height
+            left = max(8.0, min(mon_w - self.width - 8.0, left))
+            top = max(8.0, min(mon_h - self.height - 8.0, top))
+            self.panel_x = left
+            self.panel_y = top
+
+            gdk_monitor = None
+            display = Gdk.Display.get_default()
+            if display is not None and hypr_mon is not None:
+                for i in range(display.get_n_monitors()):
+                    m = display.get_monitor(i)
+                    g = m.get_geometry()
+                    if abs(g.x - mon_x) < 2 and abs(g.y - mon_y) < 2:
+                        gdk_monitor = m
+                        break
+                if gdk_monitor is None:
+                    gdk_monitor = display.get_primary_monitor()
+
+            window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            window.set_app_paintable(True)
+            window.set_decorated(False)
+            window.set_resizable(False)
+            window.set_accept_focus(True)
+            window.set_skip_taskbar_hint(True)
+            window.set_skip_pager_hint(True)
+            visual = window.get_screen().get_rgba_visual()
+            if visual is not None:
+                window.set_visual(visual)
+            GtkLayerShell.init_for_window(window)
+            GtkLayerShell.set_namespace(window, "villode-dock-menu")
+            GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_keyboard_mode(
+                window, GtkLayerShell.KeyboardMode.EXCLUSIVE
+            )
+            GtkLayerShell.set_exclusive_zone(window, -1)
+            for edge in (
+                GtkLayerShell.Edge.TOP,
+                GtkLayerShell.Edge.BOTTOM,
+                GtkLayerShell.Edge.LEFT,
+                GtkLayerShell.Edge.RIGHT,
+            ):
+                GtkLayerShell.set_anchor(window, edge, True)
+            if gdk_monitor is not None:
+                try:
+                    GtkLayerShell.set_monitor(window, gdk_monitor)
+                except Exception:
+                    pass
+
+            area = Gtk.DrawingArea()
+            area.set_app_paintable(True)
+            area.set_can_focus(True)
+            area.set_events(
+                Gdk.EventMask.EXPOSURE_MASK
+                | Gdk.EventMask.POINTER_MOTION_MASK
+                | Gdk.EventMask.BUTTON_PRESS_MASK
+                | Gdk.EventMask.BUTTON_RELEASE_MASK
+                | Gdk.EventMask.KEY_PRESS_MASK
+                | Gdk.EventMask.ENTER_NOTIFY_MASK
+                | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            )
+            area.connect("draw", self.on_draw)
+            area.connect("motion-notify-event", self.on_motion)
+            area.connect("button-press-event", self.on_button_press)
+            area.connect("key-press-event", self.on_key)
+            window.connect("destroy", lambda *_: self._cleared())
+            window.connect("key-press-event", self.on_key)
+            window.add(area)
+
+            self.window = window
+            self.area = area
+            GlassContextMenu._active = self
+            window.show_all()
+            window.present()
+            GLib.idle_add(area.grab_focus)
+
+        def _cleared(self):
+            if GlassContextMenu._active is self:
+                GlassContextMenu._active = None
+            self.window = None
+            self.area = None
+
+        def close(self):
+            win = self.window
+            self.window = None
+            self.area = None
+            if GlassContextMenu._active is self:
+                GlassContextMenu._active = None
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
+        def panel_contains(self, x, y):
+            return (
+                self.panel_x <= x <= self.panel_x + self.width
+                and self.panel_y <= y <= self.panel_y + self.height
+            )
+
+        def row_at(self, x, y):
+            if not self.panel_contains(x, y):
+                return None
+            local_y = y - self.panel_y
+            y0 = self.PAD_Y
+            for i, entry in enumerate(self.entries):
+                if entry.get("separator"):
+                    y0 += 9
+                    continue
+                y1 = y0 + self.ROW_H
+                if y0 <= local_y < y1:
+                    if entry.get("sensitive", True) is False:
+                        return None
+                    return i
+                y0 = y1
+            return None
+
+        def on_motion(self, _widget, event):
+            idx = self.row_at(event.x, event.y)
+            if idx != self.hover:
+                self.hover = idx
+                if self.area is not None:
+                    self.area.queue_draw()
+            return True
+
+        def on_button_press(self, _widget, event):
+            # Any button: activate row if hit, otherwise dismiss.
+            idx = self.row_at(event.x, event.y)
+            entry = self.entries[idx] if idx is not None else None
+            self.close()
+            if entry is not None:
+                callback = entry.get("callback")
+                if callable(callback) and entry.get("sensitive", True):
+                    GLib.idle_add(callback)
+            return True
+
+        def on_key(self, _widget, event):
+            if event.keyval == Gdk.KEY_Escape:
+                self.close()
+                return True
+            return False
+
+        def on_draw(self, _widget, cr):
+            # Full-output transparent canvas (tiny alpha so the layer keeps input).
+            cr.set_operator(cairo.OPERATOR_SOURCE)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.001)
+            cr.paint()
+            cr.set_operator(cairo.OPERATOR_OVER)
+
+            # Soft dim outside the panel so outside clicks still land here.
+            cr.set_source_rgba(0.05, 0.06, 0.08, 0.12)
+            cr.paint()
+
+            # Glass panel
+            px, py = self.panel_x, self.panel_y
+            rounded_rectangle(cr, px + 0.5, py + 0.5, self.width - 1.0, self.height - 1.0, self.RADIUS)
+            cr.set_source_rgba(0.78, 0.84, 0.91, 0.28)
+            cr.fill_preserve()
+            cr.clip()
+
+            sheen = cairo.LinearGradient(px, py, px, py + self.height)
+            sheen.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.20)
+            sheen.add_color_stop_rgba(0.45, 1.0, 1.0, 1.0, 0.07)
+            sheen.add_color_stop_rgba(1.0, 0.72, 0.80, 0.90, 0.04)
+            cr.set_source(sheen)
+            cr.paint()
+            cr.reset_clip()
+
+            cr.new_path()
+            rounded_rectangle(
+                cr, px + 0.75, py + 0.75, self.width - 1.5, self.height - 1.5, self.RADIUS - 0.5
+            )
+            cr.set_line_width(1.0)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.26)
+            cr.stroke()
+
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription("Sans Medium 11"))
+            y0 = py + self.PAD_Y
+            for i, entry in enumerate(self.entries):
+                if entry.get("separator"):
+                    cy = y0 + 4.0
+                    cr.set_source_rgba(0.08, 0.10, 0.13, 0.20)
+                    cr.set_line_width(1.0)
+                    cr.move_to(px + self.PAD_X, cy)
+                    cr.line_to(px + self.width - self.PAD_X, cy)
+                    cr.stroke()
+                    y0 += 9
+                    continue
+
+                sensitive = entry.get("sensitive", True)
+                if i == self.hover and sensitive:
+                    rounded_rectangle(
+                        cr, px + 6, y0 + 2, self.width - 12, self.ROW_H - 4, 8
+                    )
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.28)
+                    cr.fill()
+
+                layout.set_text(entry.get("label", ""), -1)
+                _tw, th = layout.get_pixel_size()
+                if sensitive:
+                    cr.set_source_rgba(0.10, 0.12, 0.15, 0.94)
+                else:
+                    cr.set_source_rgba(0.10, 0.12, 0.15, 0.40)
+                cr.move_to(px + self.PAD_X, y0 + (self.ROW_H - th) / 2.0)
+                PangoCairo.show_layout(cr, layout)
+                y0 += self.ROW_H
+            return False
+
+
+    class GlassAboutDialog:
+        """Centered glass about panel (layer-shell + Hyprland blur)."""
+
+        WIDTH = 420
+        HEIGHT = 340
+        RADIUS = 22
+        _active = None
+
+        def __init__(self, parent):
+            self.parent = parent
+            self.window = None
+            self.dismiss = None
+
+        @classmethod
+        def close_active(cls):
+            if cls._active is not None:
+                cls._active.close()
+
+        def popup(self):
+            GlassAboutDialog.close_active()
+            GlassContextMenu.close_active()
+
+            dock_layer, hypr_mon = find_layer_by_namespace("villode-dock")
+            if hypr_mon is not None:
+                mon_x = float(hypr_mon.get("x", 0))
+                mon_y = float(hypr_mon.get("y", 0))
+                mon_w = float(hypr_mon.get("width", 1920))
+                mon_h = float(hypr_mon.get("height", 1080))
+            else:
+                mon_x = mon_y = 0.0
+                mon_w, mon_h = 1920.0, 1080.0
+
+            margin_left = int(round((mon_w - self.WIDTH) / 2.0))
+            margin_top = int(round((mon_h - self.HEIGHT) / 2.0))
+
+            gdk_monitor = None
+            display = Gdk.Display.get_default()
+            if display is not None and hypr_mon is not None:
+                for i in range(display.get_n_monitors()):
+                    m = display.get_monitor(i)
+                    g = m.get_geometry()
+                    if abs(g.x - mon_x) < 2 and abs(g.y - mon_y) < 2:
+                        gdk_monitor = m
+                        break
+                if gdk_monitor is None:
+                    gdk_monitor = display.get_primary_monitor()
+
+            def make_layer(namespace, keyboard=False):
+                win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+                win.set_app_paintable(True)
+                win.set_decorated(False)
+                win.set_resizable(False)
+                win.set_accept_focus(keyboard)
+                win.set_skip_taskbar_hint(True)
+                win.set_skip_pager_hint(True)
+                visual = win.get_screen().get_rgba_visual()
+                if visual is not None:
+                    win.set_visual(visual)
+                GtkLayerShell.init_for_window(win)
+                GtkLayerShell.set_namespace(win, namespace)
+                GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+                GtkLayerShell.set_keyboard_mode(
+                    win,
+                    GtkLayerShell.KeyboardMode.ON_DEMAND
+                    if keyboard
+                    else GtkLayerShell.KeyboardMode.NONE,
+                )
+                GtkLayerShell.set_exclusive_zone(win, -1)
+                if gdk_monitor is not None:
+                    try:
+                        GtkLayerShell.set_monitor(win, gdk_monitor)
+                    except Exception:
+                        pass
+                return win
+
+            dismiss = make_layer("villode-dock-menu-dismiss", keyboard=False)
+            for edge in (
+                GtkLayerShell.Edge.TOP,
+                GtkLayerShell.Edge.BOTTOM,
+                GtkLayerShell.Edge.LEFT,
+                GtkLayerShell.Edge.RIGHT,
+            ):
+                GtkLayerShell.set_anchor(dismiss, edge, True)
+            dismiss_area = Gtk.DrawingArea()
+            dismiss_area.set_app_paintable(True)
+
+            def paint_clear(_w, cr):
+                cr.set_operator(cairo.OPERATOR_SOURCE)
+                cr.set_source_rgba(0, 0, 0, 0.18)
+                cr.paint()
+                return False
+
+            dismiss_area.connect("draw", paint_clear)
+            dismiss.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            dismiss.connect("button-press-event", lambda *_: (self.close() or True))
+            dismiss.add(dismiss_area)
+
+            window = make_layer("villode-dock-menu", keyboard=True)
+            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.LEFT, True)
+            GtkLayerShell.set_margin(window, GtkLayerShell.Edge.TOP, max(0, margin_top))
+            GtkLayerShell.set_margin(window, GtkLayerShell.Edge.LEFT, max(0, margin_left))
+
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            outer.set_size_request(self.WIDTH, self.HEIGHT)
+
+            # Glass backdrop drawn behind content
+            backdrop = Gtk.DrawingArea()
+            backdrop.set_size_request(self.WIDTH, self.HEIGHT)
+            backdrop.connect("draw", self.on_draw_backdrop)
+
+            overlay = Gtk.Overlay()
+            overlay.set_size_request(self.WIDTH, self.HEIGHT)
+            overlay.add(backdrop)
+
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            page.set_margin_start(34)
+            page.set_margin_end(34)
+            page.set_margin_top(28)
+            page.set_margin_bottom(24)
+            page.set_halign(Gtk.Align.CENTER)
+            page.set_valign(Gtk.Align.CENTER)
+
+            icon = Gtk.Image.new_from_icon_name(
+                "user-desktop-symbolic", Gtk.IconSize.DIALOG
+            )
+            icon.set_pixel_size(62)
+            icon.set_margin_bottom(14)
+            page.pack_start(icon, False, False, 0)
+
+            name = Gtk.Label()
+            name.set_markup(
+                "<span size='xx-large' weight='bold' foreground='#1a1d22'>"
+                "Villode Dock</span>"
+            )
+            name.set_justify(Gtk.Justification.CENTER)
+            page.pack_start(name, False, False, 0)
+
+            summary = Gtk.Label(
+                label="为 Hyprland 与 Wayland 设计的桌面 Dock"
+            )
+            summary.set_markup(
+                "<span foreground='#2a2f38'>为 Hyprland 与 Wayland 设计的桌面 Dock</span>"
+            )
+            summary.set_margin_top(5)
+            summary.set_margin_bottom(18)
+            page.pack_start(summary, False, False, 0)
+
+            details = Gtk.Label()
+            details.set_markup(
+                "<span foreground='#2a2f38'>"
+                "GTK 3  ·  GtkLayerShell  ·  实时合成器模糊</span>"
+            )
+            details.set_margin_bottom(14)
+            page.pack_start(details, False, False, 0)
+
+            project = Gtk.Label()
+            project.set_markup(
+                "<a href='https://github.com/Villode/villode-dock'>"
+                "GitHub 项目主页</a>"
+            )
+            project.connect(
+                "activate-link",
+                lambda _label, uri: spawn_command(["xdg-open", uri]),
+            )
+            page.pack_start(project, False, False, 0)
+
+            credits = Gtk.Label()
+            credits.set_markup(
+                "<span foreground='#4a5160' size='small'>"
+                "部分图标来自 macOSicons.com 及相应作者"
+                "  ·  <a href='villode-credits://icons'>完整署名</a>"
+                "</span>"
+            )
+            credits.set_margin_top(18)
+            credits.set_justify(Gtk.Justification.CENTER)
+
+            def open_credits(_label, uri):
+                if uri == "villode-credits://icons":
+                    spawn_command(["xdg-open", str(ICON_CREDITS)])
+                    return True
+                return False
+
+            credits.connect("activate-link", open_credits)
+            page.pack_start(credits, False, False, 0)
+
+            close_btn = Gtk.Button.new_with_label("好")
+            close_btn.set_margin_top(22)
+            close_btn.set_halign(Gtk.Align.CENTER)
+            close_btn.connect("clicked", lambda *_: self.close())
+            page.pack_start(close_btn, False, False, 0)
+
+            overlay.add_overlay(page)
+            window.add(overlay)
+            window.connect("key-press-event", self.on_key)
+            window.connect("destroy", lambda *_: self._cleared())
+
+            self.window = window
+            self.dismiss = dismiss
+            GlassAboutDialog._active = self
+            dismiss.show_all()
+            window.show_all()
+            window.present()
+
+        def on_draw_backdrop(self, _widget, cr):
+            cr.set_operator(cairo.OPERATOR_SOURCE)
+            cr.set_source_rgba(0, 0, 0, 0)
+            cr.paint()
+            cr.set_operator(cairo.OPERATOR_OVER)
+            rounded_rectangle(
+                cr, 0.5, 0.5, self.WIDTH - 1.0, self.HEIGHT - 1.0, self.RADIUS
+            )
+            cr.set_source_rgba(0.78, 0.84, 0.91, 0.24)
+            cr.fill_preserve()
+            cr.clip()
+            sheen = cairo.LinearGradient(0, 0, 0, self.HEIGHT)
+            sheen.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.20)
+            sheen.add_color_stop_rgba(0.45, 1.0, 1.0, 1.0, 0.07)
+            sheen.add_color_stop_rgba(1.0, 0.72, 0.80, 0.90, 0.04)
+            cr.set_source(sheen)
+            cr.paint()
+            cr.reset_clip()
+            cr.new_path()
+            rounded_rectangle(
+                cr, 0.75, 0.75, self.WIDTH - 1.5, self.HEIGHT - 1.5, self.RADIUS - 0.5
+            )
+            cr.set_line_width(1.0)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.24)
+            cr.stroke()
+            return False
+
+        def on_key(self, _widget, event):
+            if event.keyval == Gdk.KEY_Escape:
+                self.close()
+                return True
+            return False
+
+        def _cleared(self):
+            if GlassAboutDialog._active is self:
+                GlassAboutDialog._active = None
+            self.window = None
+            if self.dismiss is not None:
+                try:
+                    self.dismiss.destroy()
+                except Exception:
+                    pass
+                self.dismiss = None
+
+        def close(self):
+            win = self.window
+            dismiss = self.dismiss
+            self.window = None
+            self.dismiss = None
+            if GlassAboutDialog._active is self:
+                GlassAboutDialog._active = None
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+            if dismiss is not None:
+                try:
+                    dismiss.destroy()
+                except Exception:
+                    pass
+
+    BOUNCE_DURATION = 0.60
+    MIN_ANIMATION_FRAME_US = 12_000  # 72 fps on this 144 Hz panel; idle is zero fps.
+    EXCLUSIVE_ZONE = WINDOW_HEIGHT - PANEL_TOP
 
     class DockScene(Gtk.DrawingArea):
         def __init__(self, host_window, reserve_window=None, edge_window=None):
@@ -986,6 +1614,110 @@ def run_dock():
                 )
                 clean_keys.insert(0, "builtin:files")
 
+            # Unpinned apps that currently have open windows (macOS Dock style).
+            running_items = []
+            covered_patterns = set()
+            for item in pinned_items:
+                for pattern in item.get("match_patterns") or ():
+                    if pattern:
+                        covered_patterns.add(str(pattern).lower())
+            seen_running_keys = set()
+            for client in self.clients or []:
+                # Skip special / empty / dock-owned surfaces.
+                cls = str(client.get("class") or client.get("initialClass") or "").strip()
+                if not cls:
+                    continue
+                cls_l = cls.lower()
+                if cls_l in SKIP_RUNNING_CLASSES:
+                    continue
+                if any(cls_l == p or cls_l.endswith("." + p) for p in covered_patterns):
+                    continue
+                # Already matched a pinned item via item_matches_client later — also
+                # skip if any pinned pattern equals class/initialClass.
+                initial = str(client.get("initialClass") or "").lower()
+                if initial in covered_patterns or cls_l in covered_patterns:
+                    continue
+                desktop_id = desktop_id_for_window_class(cls) or desktop_id_for_window_class(
+                    client.get("initialClass")
+                )
+                if desktop_id is None:
+                    # Still show a transient running tile using the WM class.
+                    key = f"running:{cls_l}"
+                    if key in seen_running_keys:
+                        continue
+                    seen_running_keys.add(key)
+                    item = self.new_item(
+                        key,
+                        "running",
+                        None,
+                        cls,
+                        None,
+                        cls_l,
+                        match_patterns=(cls_l, initial) if initial else (cls_l,),
+                        removable=False,
+                    )
+                    item["running"] = True
+                    previous = old_items.get(key)
+                    if previous is not None:
+                        for state_key in (
+                            "scale",
+                            "target",
+                            "velocity",
+                            "layout_x",
+                            "layout_target_x",
+                            "layout_velocity",
+                            "bounce_start",
+                        ):
+                            item[state_key] = previous[state_key]
+                    running_items.append(item)
+                    covered_patterns.add(cls_l)
+                    if initial:
+                        covered_patterns.add(initial)
+                    continue
+
+                # Map to a pinned builtin if applicable (browser/terminal).
+                builtin = BUILTIN_DESKTOP_IDS.get(desktop_id.lower())
+                if builtin and f"builtin:{builtin}" in clean_keys:
+                    continue
+                key = f"desktop:{desktop_id}"
+                if key in clean_keys or key in seen_running_keys:
+                    continue
+                # Avoid duplicates when multiple windows share one app.
+                seen_running_keys.add(key)
+                entry = resolve_desktop_entry(desktop_id)
+                if entry is None:
+                    continue
+                custom_asset = f"{desktop_id}.png"
+                if not (ICON_DIR / custom_asset).is_file():
+                    custom_asset = None
+                item = self.new_item(
+                    key,
+                    "desktop",
+                    None,
+                    entry["name"],
+                    custom_asset,
+                    entry["icon"],
+                    desktop_id=desktop_id,
+                    match_patterns=entry["patterns"],
+                    removable=True,
+                )
+                item["running"] = True
+                previous = old_items.get(key)
+                if previous is not None:
+                    for state_key in (
+                        "scale",
+                        "target",
+                        "velocity",
+                        "layout_x",
+                        "layout_target_x",
+                        "layout_velocity",
+                        "bounce_start",
+                    ):
+                        item[state_key] = previous[state_key]
+                running_items.append(item)
+                for pattern in entry["patterns"]:
+                    covered_patterns.add(str(pattern).lower())
+
             place_items = []
             for action, label, asset_name, fallback_icon in PLACE_ITEMS:
                 key = f"place:{action}"
@@ -1013,8 +1745,9 @@ def run_dock():
                 place_items.append(item)
 
             self.pinned_keys = clean_keys
-            self.group_break = len(pinned_items)
-            self.items = pinned_items + place_items
+            # group_break = end of pinned+running, before places (downloads/trash)
+            self.group_break = len(pinned_items) + len(running_items)
+            self.items = pinned_items + running_items + place_items
             base_panel_width = (
                 len(self.items) * BASE_SLOT_WIDTH
                 + SEPARATOR_GAP
@@ -1637,6 +2370,44 @@ def run_dock():
             self.rebuild_items(bounce_key=key)
             return True
 
+        def pin_item(self, item):
+            """Pin an unpinned running tile (or any desktop tile) to the Dock."""
+            if not item:
+                return False
+            key = item.get("key") or ""
+            if key in self.pinned_keys:
+                return True
+            desktop_id = item.get("desktop_id")
+            if not desktop_id and key.startswith("desktop:"):
+                desktop_id = key.split(":", 1)[1]
+            if not desktop_id and key.startswith("running:"):
+                # Resolve .desktop from the live window class.
+                wm_class = key.split(":", 1)[1]
+                desktop_id = desktop_id_for_window_class(wm_class)
+                if not desktop_id:
+                    client = self.matching_client(item)
+                    if client is not None:
+                        desktop_id = desktop_id_for_window_class(
+                            client.get("class")
+                        ) or desktop_id_for_window_class(client.get("initialClass"))
+            if not desktop_id:
+                return False
+            # Append after the last currently pinned item (before running/places).
+            return self.pin_desktop(desktop_id, len(self.pinned_keys))
+
+        def item_is_pinned(self, item):
+            key = (item or {}).get("key") or ""
+            if key in self.pinned_keys:
+                return True
+            desktop_id = (item or {}).get("desktop_id")
+            if desktop_id:
+                builtin = BUILTIN_DESKTOP_IDS.get(str(desktop_id).lower())
+                if builtin and f"builtin:{builtin}" in self.pinned_keys:
+                    return True
+                if f"desktop:{desktop_id}" in self.pinned_keys:
+                    return True
+            return False
+
         def unpin_key(self, key):
             if key in {"builtin:files", "builtin:launcher"}:
                 return
@@ -1838,11 +2609,19 @@ def run_dock():
                 patterns = terminal_window_classes(terminal_command())
             elif item["action"] == "browser":
                 patterns = browser_window_classes(browser_command())
-            return any(
-                pattern and pattern == value
-                for pattern in patterns
-                for value in values
-            )
+            for pattern in patterns:
+                if not pattern:
+                    continue
+                p = str(pattern).lower()
+                for value in values:
+                    if not value:
+                        continue
+                    if p == value or value.endswith("." + p) or p.endswith("." + value):
+                        return True
+                    # chrome / google-chrome soft match
+                    if p.replace("-", "") == value.replace("-", ""):
+                        return True
+            return False
 
         def matching_client(self, item):
             for client in self.clients:
@@ -1858,13 +2637,19 @@ def run_dock():
 
         def activate(self, index, force_new=False):
             item = self.items[index]
-            focusable = item["kind"] == "desktop" or item["action"] in FOCUSABLE
+            focusable = (
+                item["kind"] in {"desktop", "running"}
+                or item["action"] in FOCUSABLE
+            )
             if focusable and not force_new:
                 client = self.matching_client(item)
                 if client is not None and self.focus_client(client):
                     return
-            if item["kind"] == "desktop":
+            if item["kind"] == "desktop" and item.get("desktop_id"):
                 command = ["gtk-launch", item["desktop_id"]]
+            elif item["kind"] == "running":
+                # No desktop file — just try to focus; cannot launch again.
+                return
             elif item["action"] == "files":
                 command = file_manager_command(Path.home())
             elif item["action"] == "downloads":
@@ -1876,12 +2661,15 @@ def run_dock():
             elif item["action"] == "browser":
                 command = browser_command()
             else:
-                command = ACTIONS[item["action"]]
+                command = ACTIONS.get(item["action"])
+                if not command:
+                    return
             if spawn_command(command):
                 item["bounce_start"] = time.monotonic()
                 self.ensure_tick()
 
         def menu_item(self, label, callback):
+            # Kept for compatibility; glass menus use entry dicts instead.
             item = Gtk.MenuItem.new_with_label(label)
             item.connect("activate", callback)
             return item
@@ -1944,148 +2732,104 @@ def run_dock():
             return GLib.SOURCE_REMOVE
 
         def show_about(self):
-            dialog = Gtk.Dialog(
-                title="关于 Villode Dock",
-                transient_for=self.host_window,
-                modal=True,
-            )
-            dialog.set_default_size(430, 330)
-            dialog.set_resizable(False)
-            dialog.set_decorated(True)
-
-            header = Gtk.HeaderBar()
-            header.set_title("关于")
-            header.set_show_close_button(True)
-            dialog.set_titlebar(header)
-
-            content = dialog.get_content_area()
-            content.set_border_width(0)
-
-            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-            page.set_margin_start(34)
-            page.set_margin_end(34)
-            page.set_margin_top(28)
-            page.set_margin_bottom(24)
-            content.pack_start(page, True, True, 0)
-
-            icon = Gtk.Image.new_from_icon_name(
-                "user-desktop-symbolic",
-                Gtk.IconSize.DIALOG,
-            )
-            icon.set_pixel_size(62)
-            icon.set_margin_bottom(14)
-            page.pack_start(icon, False, False, 0)
-
-            name = Gtk.Label()
-            name.set_markup(
-                "<span size='xx-large' weight='bold'>Villode Dock</span>"
-            )
-            name.set_justify(Gtk.Justification.CENTER)
-            page.pack_start(name, False, False, 0)
-
-            summary = Gtk.Label(
-                label="为 Hyprland 与 Wayland 设计的桌面 Dock"
-            )
-            summary.get_style_context().add_class("dim-label")
-            summary.set_margin_top(5)
-            summary.set_margin_bottom(20)
-            page.pack_start(summary, False, False, 0)
-
-            details = Gtk.Label()
-            details.set_markup(
-                "<span>GTK 3  ·  GtkLayerShell  ·  实时合成器模糊</span>"
-            )
-            details.set_justify(Gtk.Justification.CENTER)
-            details.set_margin_bottom(16)
-            page.pack_start(details, False, False, 0)
-
-            project = Gtk.Label()
-            project.set_markup(
-                "<a href='https://github.com/Villode/villode-dock'>"
-                "GitHub 项目主页</a>"
-            )
-            project.connect(
-                "activate-link",
-                lambda _label, uri: spawn_command(["xdg-open", uri]),
-            )
-            page.pack_start(project, False, False, 0)
-
-            separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-            separator.set_margin_top(22)
-            separator.set_margin_bottom(15)
-            page.pack_start(separator, False, False, 0)
-
-            credits = Gtk.Label()
-            credits.set_markup(
-                "部分图标来自 macOSicons.com 及相应作者"
-                "  ·  <a href='villode-credits://icons'>完整署名</a>"
-            )
-            credits.get_style_context().add_class("dim-label")
-            credits.set_justify(Gtk.Justification.CENTER)
-
-            def open_credits(_label, uri):
-                if uri == "villode-credits://icons":
-                    spawn_command(["xdg-open", str(ICON_CREDITS)])
-                    return True
-                return False
-
-            credits.connect("activate-link", open_credits)
-            page.pack_end(credits, False, False, 0)
-
-            dialog.show_all()
-            dialog.run()
-            dialog.destroy()
+            GlassAboutDialog(self.host_window).popup()
 
         def show_context_menu(self, event, index):
-            menu = Gtk.Menu()
+            entries = []
             if index is not None:
                 dock_item = self.items[index]
                 label = dock_item["label"]
-                menu.append(
-                    self.menu_item(
-                        f"打开“{label}”", lambda _item, i=index: self.activate(i)
-                    )
+                entries.append(
+                    {
+                        "label": f"打开“{label}”",
+                        "callback": lambda i=index: self.activate(i),
+                    }
                 )
                 if (
-                    dock_item["kind"] == "desktop"
+                    dock_item["kind"] in {"desktop", "running"}
                     or dock_item["action"] in FOCUSABLE
                 ):
-                    menu.append(
-                        self.menu_item(
-                            "打开新窗口",
-                            lambda _item, i=index: self.activate(i, force_new=True),
+                    if dock_item["kind"] != "running" or dock_item.get("desktop_id"):
+                        entries.append(
+                            {
+                                "label": "打开新窗口",
+                                "callback": lambda i=index: self.activate(
+                                    i, force_new=True
+                                ),
+                            }
                         )
-                    )
                 if dock_item["action"] == "trash":
-                    empty_item = self.menu_item(
-                        "清空废纸篓…",
-                        lambda _item: self.empty_trash(),
+                    entries.append(
+                        {
+                            "label": "清空废纸篓…",
+                            "callback": self.empty_trash,
+                            "sensitive": self.trash_full,
+                        }
                     )
-                    empty_item.set_sensitive(self.trash_full)
-                    menu.append(empty_item)
-                if dock_item["removable"]:
-                    menu.append(
-                        self.menu_item(
-                            "从 Dock 移除",
-                            lambda _item, key=dock_item["key"]: self.unpin_key(key),
+
+                pinned = self.item_is_pinned(dock_item)
+                if not pinned and dock_item["kind"] in {"desktop", "running"}:
+                    can_pin = bool(
+                        dock_item.get("desktop_id")
+                        or (dock_item.get("key") or "").startswith("desktop:")
+                        or desktop_id_for_window_class(
+                            (dock_item.get("key") or "").split(":", 1)[-1]
                         )
                     )
-                menu.append(Gtk.SeparatorMenuItem())
+                    entries.append(
+                        {
+                            "label": "固定到 Dock",
+                            "callback": lambda it=dock_item: self.pin_item(it),
+                            "sensitive": can_pin,
+                        }
+                    )
+                elif pinned and dock_item["removable"]:
+                    entries.append(
+                        {
+                            "label": "从 Dock 移除",
+                            "callback": lambda key=dock_item["key"]: self.unpin_key(
+                                key
+                            ),
+                        }
+                    )
+                entries.append({"separator": True})
 
-            menu.append(
-                self.menu_item(
-                    "重新载入 Dock",
-                    lambda _item: spawn_command([sys.executable, str(SCRIPT), "--reload"]),
-                )
+            entries.append(
+                {
+                    "label": "重新载入 Dock",
+                    "callback": lambda: spawn_command(
+                        [sys.executable, str(SCRIPT), "--reload"]
+                    ),
+                }
             )
-            menu.append(
-                self.menu_item(
-                    "关于 Villode Dock…",
-                    lambda _item: self.show_about(),
-                )
+            entries.append(
+                {
+                    "label": "关于 Villode Dock…",
+                    "callback": self.show_about,
+                }
             )
-            menu.show_all()
-            menu.popup_at_pointer(event)
+
+            # Absolute compositor coords from Hyprland layer geometry (Wayland-safe).
+            # GDK get_origin() is often (0,0) on layer-shell surfaces.
+            dock_layer, _mon = find_layer_by_namespace("villode-dock")
+            if dock_layer is not None:
+                ox = float(dock_layer.get("x", 0))
+                oy = float(dock_layer.get("y", 0))
+            else:
+                ox = oy = 0.0
+
+            if index is not None and self.layout and index < len(
+                self.layout.get("items", [])
+            ):
+                entry = self.layout["items"][index]
+                screen_x = ox + float(entry["center_x"])
+                screen_y = oy + float(PANEL_TOP) - 10.0
+            else:
+                screen_x = ox + float(event.x)
+                screen_y = oy + float(event.y)
+
+            GlassContextMenu.close_active()
+            GlassContextMenu(self.host_window, entries, screen_x, screen_y).popup()
 
         def request_state_refresh(self):
             if self.refresh_in_flight:
@@ -2188,26 +2932,47 @@ def run_dock():
             self, clients, trash_full, fullscreen, files_patterns
         ):
             self.refresh_in_flight = False
+            clients_changed = False
             if clients is not None:
+                # Detect open/close so unpinned running apps can appear/disappear.
+                old_addrs = {
+                    str(c.get("address", ""))
+                    for c in (self.clients or [])
+                    if c.get("address")
+                }
+                new_addrs = {
+                    str(c.get("address", ""))
+                    for c in clients
+                    if c.get("address")
+                }
+                clients_changed = old_addrs != new_addrs
                 self.clients = clients
             if fullscreen is not None:
                 self.set_fullscreen_hidden(fullscreen)
-            changed = False
-            for item in self.items:
-                if item["action"] == "files":
-                    item["match_patterns"] = tuple(files_patterns)
-                running = bool(item["match_patterns"]) and any(
-                    self.item_matches_client(item, client) for client in self.clients
-                )
-                if running != item["running"]:
-                    item["running"] = running
+
+            if clients_changed:
+                # Rebuild so unpinned open apps show as temporary Dock tiles.
+                self.rebuild_items(resize=True)
+            else:
+                changed = False
+                for item in self.items:
+                    if item["action"] == "files":
+                        item["match_patterns"] = tuple(files_patterns)
+                    running = bool(item["match_patterns"]) and any(
+                        self.item_matches_client(item, client)
+                        for client in self.clients
+                    )
+                    if running != item["running"]:
+                        item["running"] = running
+                        changed = True
+                if self.apply_trash_state(trash_full):
                     changed = True
+                if changed:
+                    self.queue_draw()
 
-            if self.apply_trash_state(trash_full):
-                changed = True
+            if clients_changed:
+                self.apply_trash_state(trash_full)
 
-            if changed:
-                self.queue_draw()
             if self.refresh_pending:
                 self.refresh_pending = False
                 self.request_state_refresh()
