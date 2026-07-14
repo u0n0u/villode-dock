@@ -869,11 +869,11 @@ def run_dock():
         cr.close_path()
 
     class GlassContextMenu:
-        """Compact glass menu + separate unblurred full-screen dismiss.
+        """Compact glass menu only (no full-screen dismiss layer).
 
-        Hyprland blurs entire layer surfaces, so the menu window is sized
-        exactly to the panel (blurred). Outside clicks hit a second layer
-        without blur that only dims slightly and closes the menu.
+        Hyprland blurs whole layer surfaces, so the window is sized exactly to
+        the menu panel. Outside clicks are handled by a Hyprland event listener
+        (and Esc). This avoids a second layer stealing menu clicks.
         """
 
         ROW_H = 36
@@ -890,10 +890,11 @@ def run_dock():
             self.screen_y = float(screen_y)
             self.hover = None
             self.window = None
-            self.dismiss = None
             self.area = None
             self.width = self.MIN_WIDTH
             self.height = self.PAD_Y * 2
+            self.outside_listener = None
+            self.outside_stop = False
 
         @classmethod
         def close_active(cls):
@@ -902,8 +903,10 @@ def run_dock():
 
         def _gdk_monitor_for(self, hypr_mon):
             display = Gdk.Display.get_default()
-            if display is None or hypr_mon is None:
-                return display.get_primary_monitor() if display else None
+            if display is None:
+                return None
+            if hypr_mon is None:
+                return display.get_primary_monitor()
             mon_x = float(hypr_mon.get("x", 0))
             mon_y = float(hypr_mon.get("y", 0))
             mon_w = float(hypr_mon.get("width", 0))
@@ -913,34 +916,6 @@ def run_dock():
                 if abs(g.x - mon_x) < 2 and abs(g.y - mon_y) < 2 and abs(g.width - mon_w) < 2:
                     return m
             return display.get_primary_monitor()
-
-        def _make_layer(self, namespace, keyboard, gdk_monitor):
-            win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
-            win.set_app_paintable(True)
-            win.set_decorated(False)
-            win.set_resizable(False)
-            win.set_accept_focus(keyboard)
-            win.set_skip_taskbar_hint(True)
-            win.set_skip_pager_hint(True)
-            visual = win.get_screen().get_rgba_visual()
-            if visual is not None:
-                win.set_visual(visual)
-            GtkLayerShell.init_for_window(win)
-            GtkLayerShell.set_namespace(win, namespace)
-            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
-            GtkLayerShell.set_keyboard_mode(
-                win,
-                GtkLayerShell.KeyboardMode.ON_DEMAND
-                if keyboard
-                else GtkLayerShell.KeyboardMode.NONE,
-            )
-            GtkLayerShell.set_exclusive_zone(win, -1)
-            if gdk_monitor is not None:
-                try:
-                    GtkLayerShell.set_monitor(win, gdk_monitor)
-                except Exception:
-                    pass
-            return win
 
         def popup(self):
             GlassContextMenu.close_active()
@@ -982,68 +957,62 @@ def run_dock():
             margin_top = int(round(top))
             gdk_monitor = self._gdk_monitor_for(hypr_mon)
 
-            # 1) Full-screen dismiss: NO blur (hypr rule), only light dim + click-to-close.
-            dismiss = self._make_layer(
-                "villode-dock-menu-dismiss", False, gdk_monitor
+            window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            window.set_app_paintable(True)
+            window.set_decorated(False)
+            window.set_resizable(False)
+            window.set_accept_focus(True)
+            window.set_skip_taskbar_hint(True)
+            window.set_skip_pager_hint(True)
+            visual = window.get_screen().get_rgba_visual()
+            if visual is not None:
+                window.set_visual(visual)
+            GtkLayerShell.init_for_window(window)
+            GtkLayerShell.set_namespace(window, "villode-dock-menu")
+            GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+            # Exclusive keyboard so Esc always reaches us.
+            GtkLayerShell.set_keyboard_mode(
+                window, GtkLayerShell.KeyboardMode.EXCLUSIVE
             )
-            for edge in (
-                GtkLayerShell.Edge.TOP,
-                GtkLayerShell.Edge.BOTTOM,
-                GtkLayerShell.Edge.LEFT,
-                GtkLayerShell.Edge.RIGHT,
-            ):
-                GtkLayerShell.set_anchor(dismiss, edge, True)
-            dismiss_area = Gtk.DrawingArea()
-            dismiss_area.set_app_paintable(True)
-
-            def paint_dim(_w, cr):
-                cr.set_operator(cairo.OPERATOR_SOURCE)
-                # Opaque enough for input; no blur on this namespace.
-                cr.set_source_rgba(0.04, 0.05, 0.07, 0.16)
-                cr.paint()
-                return False
-
-            dismiss_area.connect("draw", paint_dim)
-            dismiss.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
-            dismiss.connect(
-                "button-press-event", lambda *_a: (self.close() or True)
-            )
-            dismiss.add(dismiss_area)
-
-            # 2) Compact menu panel only — this namespace has blur.
-            window = self._make_layer("villode-dock-menu", True, gdk_monitor)
+            GtkLayerShell.set_exclusive_zone(window, -1)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.LEFT, True)
             GtkLayerShell.set_margin(window, GtkLayerShell.Edge.TOP, max(0, margin_top))
             GtkLayerShell.set_margin(window, GtkLayerShell.Edge.LEFT, max(0, margin_left))
+            if gdk_monitor is not None:
+                try:
+                    GtkLayerShell.set_monitor(window, gdk_monitor)
+                except Exception:
+                    pass
 
             area = Gtk.DrawingArea()
             area.set_size_request(self.width, self.height)
             area.set_app_paintable(True)
             area.set_can_focus(True)
-            area.set_events(
-                Gdk.EventMask.EXPOSURE_MASK
-                | Gdk.EventMask.POINTER_MOTION_MASK
+            # add_events merges; set_events replaces and can drop button events on some GTK builds.
+            area.add_events(
+                Gdk.EventMask.POINTER_MOTION_MASK
                 | Gdk.EventMask.BUTTON_PRESS_MASK
                 | Gdk.EventMask.BUTTON_RELEASE_MASK
                 | Gdk.EventMask.KEY_PRESS_MASK
+                | Gdk.EventMask.ENTER_NOTIFY_MASK
+                | Gdk.EventMask.LEAVE_NOTIFY_MASK
             )
             area.connect("draw", self.on_draw)
             area.connect("motion-notify-event", self.on_motion)
             area.connect("leave-notify-event", self.on_leave)
             area.connect("button-press-event", self.on_button_press)
+            area.connect("button-release-event", self.on_button_release)
             area.connect("key-press-event", self.on_key)
             window.connect("key-press-event", self.on_key)
+            window.connect("button-press-event", self.on_button_press)
+            window.connect("button-release-event", self.on_button_release)
             window.connect("destroy", lambda *_: self._cleared())
             window.add(area)
 
             self.window = window
-            self.dismiss = dismiss
             self.area = area
             GlassContextMenu._active = self
-
-            # Dismiss first (lower order 40), menu second (order 60) so clicks hit menu.
-            dismiss.show_all()
             window.show_all()
             window.present()
             GLib.idle_add(area.grab_focus)
@@ -1053,29 +1022,16 @@ def run_dock():
                 GlassContextMenu._active = None
             self.window = None
             self.area = None
-            if self.dismiss is not None:
-                try:
-                    self.dismiss.destroy()
-                except Exception:
-                    pass
-                self.dismiss = None
 
         def close(self):
             win = self.window
-            dismiss = self.dismiss
             self.window = None
             self.area = None
-            self.dismiss = None
             if GlassContextMenu._active is self:
                 GlassContextMenu._active = None
             if win is not None:
                 try:
                     win.destroy()
-                except Exception:
-                    pass
-            if dismiss is not None:
-                try:
-                    dismiss.destroy()
                 except Exception:
                     pass
 
@@ -1108,14 +1064,26 @@ def run_dock():
                     self.area.queue_draw()
             return True
 
-        def on_button_press(self, _widget, event):
-            idx = self.row_at(event.x, event.y)
+        def _activate_at(self, x, y):
+            idx = self.row_at(x, y)
             entry = self.entries[idx] if idx is not None else None
             self.close()
             if entry is not None:
                 callback = entry.get("callback")
                 if callable(callback) and entry.get("sensitive", True):
                     GLib.idle_add(callback)
+            return True
+
+        def on_button_press(self, _widget, event):
+            if event.button in (Gdk.BUTTON_PRIMARY, Gdk.BUTTON_SECONDARY):
+                return self._activate_at(event.x, event.y)
+            self.close()
+            return True
+
+        def on_button_release(self, _widget, event):
+            # Some GTK/Wayland builds only deliver release reliably.
+            if event.button == Gdk.BUTTON_PRIMARY:
+                return self._activate_at(event.x, event.y)
             return True
 
         def on_key(self, _widget, event):
@@ -1125,7 +1093,6 @@ def run_dock():
             return False
 
         def on_draw(self, _widget, cr):
-            # Only the menu panel surface — Hyprland blurs this whole (small) layer.
             cr.set_operator(cairo.OPERATOR_SOURCE)
             cr.set_source_rgba(0.0, 0.0, 0.0, 0.0)
             cr.paint()
@@ -1263,36 +1230,17 @@ def run_dock():
                         pass
                 return win
 
-            dismiss = make_layer("villode-dock-menu-dismiss", keyboard=False)
-            for edge in (
-                GtkLayerShell.Edge.TOP,
-                GtkLayerShell.Edge.BOTTOM,
-                GtkLayerShell.Edge.LEFT,
-                GtkLayerShell.Edge.RIGHT,
-            ):
-                GtkLayerShell.set_anchor(dismiss, edge, True)
-            dismiss_area = Gtk.DrawingArea()
-            dismiss_area.set_app_paintable(True)
-
-            def paint_clear(_w, cr):
-                cr.set_operator(cairo.OPERATOR_SOURCE)
-                cr.set_source_rgba(0, 0, 0, 0.18)
-                cr.paint()
-                return False
-
-            dismiss_area.connect("draw", paint_clear)
-            dismiss.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
-            dismiss.connect("button-press-event", lambda *_: (self.close() or True))
-            dismiss.add(dismiss_area)
-
             window = make_layer("villode-dock-menu", keyboard=True)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.LEFT, True)
             GtkLayerShell.set_margin(window, GtkLayerShell.Edge.TOP, max(0, margin_top))
             GtkLayerShell.set_margin(window, GtkLayerShell.Edge.LEFT, max(0, margin_left))
-
-            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-            outer.set_size_request(self.WIDTH, self.HEIGHT)
+            try:
+                GtkLayerShell.set_keyboard_mode(
+                    window, GtkLayerShell.KeyboardMode.EXCLUSIVE
+                )
+            except Exception:
+                pass
 
             # Glass backdrop drawn behind content
             backdrop = Gtk.DrawingArea()
@@ -1326,9 +1274,7 @@ def run_dock():
             name.set_justify(Gtk.Justification.CENTER)
             page.pack_start(name, False, False, 0)
 
-            summary = Gtk.Label(
-                label="为 Hyprland 与 Wayland 设计的桌面 Dock"
-            )
+            summary = Gtk.Label()
             summary.set_markup(
                 "<span foreground='#2a2f38'>为 Hyprland 与 Wayland 设计的桌面 Dock</span>"
             )
@@ -1386,9 +1332,8 @@ def run_dock():
             window.connect("destroy", lambda *_: self._cleared())
 
             self.window = window
-            self.dismiss = dismiss
+            self.dismiss = None
             GlassAboutDialog._active = self
-            dismiss.show_all()
             window.show_all()
             window.present()
 
@@ -1429,16 +1374,10 @@ def run_dock():
             if GlassAboutDialog._active is self:
                 GlassAboutDialog._active = None
             self.window = None
-            if self.dismiss is not None:
-                try:
-                    self.dismiss.destroy()
-                except Exception:
-                    pass
-                self.dismiss = None
+            self.dismiss = None
 
         def close(self):
             win = self.window
-            dismiss = self.dismiss
             self.window = None
             self.dismiss = None
             if GlassAboutDialog._active is self:
@@ -1446,11 +1385,6 @@ def run_dock():
             if win is not None:
                 try:
                     win.destroy()
-                except Exception:
-                    pass
-            if dismiss is not None:
-                try:
-                    dismiss.destroy()
                 except Exception:
                     pass
 
