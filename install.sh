@@ -86,6 +86,13 @@ exec-once = villode-dock --daemon
 layerrule = blur true, match:namespace villode-dock
 layerrule = ignore_alpha 0.12, match:namespace villode-dock
 layerrule = xray false, match:namespace villode-dock
+# Context menu / about (glass layer, same blur as the dock panel)
+layerrule = blur true, match:namespace villode-dock-menu
+layerrule = ignore_alpha 0.12, match:namespace villode-dock-menu
+layerrule = xray false, match:namespace villode-dock-menu
+layerrule = order 50, match:namespace villode-dock
+layerrule = order 60, match:namespace villode-dock-menu
+layerrule = order 10, match:namespace caelestia-drawers
 EOF
 
   mkdir -p "$HYPR_DIR"
