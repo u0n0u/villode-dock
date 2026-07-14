@@ -869,10 +869,11 @@ def run_dock():
         cr.close_path()
 
     class GlassContextMenu:
-        """Single full-output layer: dim backdrop + glass menu panel.
+        """Compact glass menu + separate unblurred full-screen dismiss.
 
-        One surface avoids stacking races where a dismiss layer steals clicks.
-        Clicks on a row activate it; clicks outside close the menu.
+        Hyprland blurs entire layer surfaces, so the menu window is sized
+        exactly to the panel (blurred). Outside clicks hit a second layer
+        without blur that only dims slightly and closes the menu.
         """
 
         ROW_H = 36
@@ -889,18 +890,57 @@ def run_dock():
             self.screen_y = float(screen_y)
             self.hover = None
             self.window = None
+            self.dismiss = None
             self.area = None
-            self.panel_x = 0.0
-            self.panel_y = 0.0
             self.width = self.MIN_WIDTH
             self.height = self.PAD_Y * 2
-            self.mon_w = 1920.0
-            self.mon_h = 1080.0
 
         @classmethod
         def close_active(cls):
             if cls._active is not None:
                 cls._active.close()
+
+        def _gdk_monitor_for(self, hypr_mon):
+            display = Gdk.Display.get_default()
+            if display is None or hypr_mon is None:
+                return display.get_primary_monitor() if display else None
+            mon_x = float(hypr_mon.get("x", 0))
+            mon_y = float(hypr_mon.get("y", 0))
+            mon_w = float(hypr_mon.get("width", 0))
+            for i in range(display.get_n_monitors()):
+                m = display.get_monitor(i)
+                g = m.get_geometry()
+                if abs(g.x - mon_x) < 2 and abs(g.y - mon_y) < 2 and abs(g.width - mon_w) < 2:
+                    return m
+            return display.get_primary_monitor()
+
+        def _make_layer(self, namespace, keyboard, gdk_monitor):
+            win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            win.set_app_paintable(True)
+            win.set_decorated(False)
+            win.set_resizable(False)
+            win.set_accept_focus(keyboard)
+            win.set_skip_taskbar_hint(True)
+            win.set_skip_pager_hint(True)
+            visual = win.get_screen().get_rgba_visual()
+            if visual is not None:
+                win.set_visual(visual)
+            GtkLayerShell.init_for_window(win)
+            GtkLayerShell.set_namespace(win, namespace)
+            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_keyboard_mode(
+                win,
+                GtkLayerShell.KeyboardMode.ON_DEMAND
+                if keyboard
+                else GtkLayerShell.KeyboardMode.NONE,
+            )
+            GtkLayerShell.set_exclusive_zone(win, -1)
+            if gdk_monitor is not None:
+                try:
+                    GtkLayerShell.set_monitor(win, gdk_monitor)
+                except Exception:
+                    pass
+            return win
 
         def popup(self):
             GlassContextMenu.close_active()
@@ -924,7 +964,7 @@ def run_dock():
                 h += 9 if entry.get("separator") else self.ROW_H
             self.height = int(h)
 
-            dock_layer, hypr_mon = find_layer_by_namespace("villode-dock")
+            _dock_layer, hypr_mon = find_layer_by_namespace("villode-dock")
             if hypr_mon is not None:
                 mon_x = float(hypr_mon.get("x", 0))
                 mon_y = float(hypr_mon.get("y", 0))
@@ -933,59 +973,52 @@ def run_dock():
             else:
                 mon_x = mon_y = 0.0
                 mon_w, mon_h = 1920.0, 1080.0
-            self.mon_w, self.mon_h = mon_w, mon_h
 
-            # Absolute → output-local panel position (bottom-centered on anchor).
             left = self.screen_x - mon_x - self.width / 2.0
             top = self.screen_y - mon_y - self.height
             left = max(8.0, min(mon_w - self.width - 8.0, left))
             top = max(8.0, min(mon_h - self.height - 8.0, top))
-            self.panel_x = left
-            self.panel_y = top
+            margin_left = int(round(left))
+            margin_top = int(round(top))
+            gdk_monitor = self._gdk_monitor_for(hypr_mon)
 
-            gdk_monitor = None
-            display = Gdk.Display.get_default()
-            if display is not None and hypr_mon is not None:
-                for i in range(display.get_n_monitors()):
-                    m = display.get_monitor(i)
-                    g = m.get_geometry()
-                    if abs(g.x - mon_x) < 2 and abs(g.y - mon_y) < 2:
-                        gdk_monitor = m
-                        break
-                if gdk_monitor is None:
-                    gdk_monitor = display.get_primary_monitor()
-
-            window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
-            window.set_app_paintable(True)
-            window.set_decorated(False)
-            window.set_resizable(False)
-            window.set_accept_focus(True)
-            window.set_skip_taskbar_hint(True)
-            window.set_skip_pager_hint(True)
-            visual = window.get_screen().get_rgba_visual()
-            if visual is not None:
-                window.set_visual(visual)
-            GtkLayerShell.init_for_window(window)
-            GtkLayerShell.set_namespace(window, "villode-dock-menu")
-            GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
-            GtkLayerShell.set_keyboard_mode(
-                window, GtkLayerShell.KeyboardMode.EXCLUSIVE
+            # 1) Full-screen dismiss: NO blur (hypr rule), only light dim + click-to-close.
+            dismiss = self._make_layer(
+                "villode-dock-menu-dismiss", False, gdk_monitor
             )
-            GtkLayerShell.set_exclusive_zone(window, -1)
             for edge in (
                 GtkLayerShell.Edge.TOP,
                 GtkLayerShell.Edge.BOTTOM,
                 GtkLayerShell.Edge.LEFT,
                 GtkLayerShell.Edge.RIGHT,
             ):
-                GtkLayerShell.set_anchor(window, edge, True)
-            if gdk_monitor is not None:
-                try:
-                    GtkLayerShell.set_monitor(window, gdk_monitor)
-                except Exception:
-                    pass
+                GtkLayerShell.set_anchor(dismiss, edge, True)
+            dismiss_area = Gtk.DrawingArea()
+            dismiss_area.set_app_paintable(True)
+
+            def paint_dim(_w, cr):
+                cr.set_operator(cairo.OPERATOR_SOURCE)
+                # Opaque enough for input; no blur on this namespace.
+                cr.set_source_rgba(0.04, 0.05, 0.07, 0.16)
+                cr.paint()
+                return False
+
+            dismiss_area.connect("draw", paint_dim)
+            dismiss.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            dismiss.connect(
+                "button-press-event", lambda *_a: (self.close() or True)
+            )
+            dismiss.add(dismiss_area)
+
+            # 2) Compact menu panel only — this namespace has blur.
+            window = self._make_layer("villode-dock-menu", True, gdk_monitor)
+            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.LEFT, True)
+            GtkLayerShell.set_margin(window, GtkLayerShell.Edge.TOP, max(0, margin_top))
+            GtkLayerShell.set_margin(window, GtkLayerShell.Edge.LEFT, max(0, margin_left))
 
             area = Gtk.DrawingArea()
+            area.set_size_request(self.width, self.height)
             area.set_app_paintable(True)
             area.set_can_focus(True)
             area.set_events(
@@ -994,20 +1027,23 @@ def run_dock():
                 | Gdk.EventMask.BUTTON_PRESS_MASK
                 | Gdk.EventMask.BUTTON_RELEASE_MASK
                 | Gdk.EventMask.KEY_PRESS_MASK
-                | Gdk.EventMask.ENTER_NOTIFY_MASK
-                | Gdk.EventMask.LEAVE_NOTIFY_MASK
             )
             area.connect("draw", self.on_draw)
             area.connect("motion-notify-event", self.on_motion)
+            area.connect("leave-notify-event", self.on_leave)
             area.connect("button-press-event", self.on_button_press)
             area.connect("key-press-event", self.on_key)
-            window.connect("destroy", lambda *_: self._cleared())
             window.connect("key-press-event", self.on_key)
+            window.connect("destroy", lambda *_: self._cleared())
             window.add(area)
 
             self.window = window
+            self.dismiss = dismiss
             self.area = area
             GlassContextMenu._active = self
+
+            # Dismiss first (lower order 40), menu second (order 60) so clicks hit menu.
+            dismiss.show_all()
             window.show_all()
             window.present()
             GLib.idle_add(area.grab_focus)
@@ -1017,11 +1053,19 @@ def run_dock():
                 GlassContextMenu._active = None
             self.window = None
             self.area = None
+            if self.dismiss is not None:
+                try:
+                    self.dismiss.destroy()
+                except Exception:
+                    pass
+                self.dismiss = None
 
         def close(self):
             win = self.window
+            dismiss = self.dismiss
             self.window = None
             self.area = None
+            self.dismiss = None
             if GlassContextMenu._active is self:
                 GlassContextMenu._active = None
             if win is not None:
@@ -1029,24 +1073,20 @@ def run_dock():
                     win.destroy()
                 except Exception:
                     pass
-
-        def panel_contains(self, x, y):
-            return (
-                self.panel_x <= x <= self.panel_x + self.width
-                and self.panel_y <= y <= self.panel_y + self.height
-            )
+            if dismiss is not None:
+                try:
+                    dismiss.destroy()
+                except Exception:
+                    pass
 
         def row_at(self, x, y):
-            if not self.panel_contains(x, y):
-                return None
-            local_y = y - self.panel_y
             y0 = self.PAD_Y
             for i, entry in enumerate(self.entries):
                 if entry.get("separator"):
                     y0 += 9
                     continue
                 y1 = y0 + self.ROW_H
-                if y0 <= local_y < y1:
+                if y0 <= y < y1 and 0 <= x <= self.width:
                     if entry.get("sensitive", True) is False:
                         return None
                     return i
@@ -1061,8 +1101,14 @@ def run_dock():
                     self.area.queue_draw()
             return True
 
+        def on_leave(self, _widget, _event):
+            if self.hover is not None:
+                self.hover = None
+                if self.area is not None:
+                    self.area.queue_draw()
+            return True
+
         def on_button_press(self, _widget, event):
-            # Any button: activate row if hit, otherwise dismiss.
             idx = self.row_at(event.x, event.y)
             entry = self.entries[idx] if idx is not None else None
             self.close()
@@ -1079,24 +1125,20 @@ def run_dock():
             return False
 
         def on_draw(self, _widget, cr):
-            # Full-output transparent canvas (tiny alpha so the layer keeps input).
+            # Only the menu panel surface — Hyprland blurs this whole (small) layer.
             cr.set_operator(cairo.OPERATOR_SOURCE)
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.001)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0)
             cr.paint()
             cr.set_operator(cairo.OPERATOR_OVER)
 
-            # Soft dim outside the panel so outside clicks still land here.
-            cr.set_source_rgba(0.05, 0.06, 0.08, 0.18)
-            cr.paint()
-
-            # Glass panel
-            px, py = self.panel_x, self.panel_y
-            rounded_rectangle(cr, px + 0.5, py + 0.5, self.width - 1.0, self.height - 1.0, self.RADIUS)
+            rounded_rectangle(
+                cr, 0.5, 0.5, self.width - 1.0, self.height - 1.0, self.RADIUS
+            )
             cr.set_source_rgba(0.78, 0.84, 0.91, 0.34)
             cr.fill_preserve()
             cr.clip()
 
-            sheen = cairo.LinearGradient(px, py, px, py + self.height)
+            sheen = cairo.LinearGradient(0, 0, 0, self.height)
             sheen.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.20)
             sheen.add_color_stop_rgba(0.45, 1.0, 1.0, 1.0, 0.07)
             sheen.add_color_stop_rgba(1.0, 0.72, 0.80, 0.90, 0.04)
@@ -1106,7 +1148,7 @@ def run_dock():
 
             cr.new_path()
             rounded_rectangle(
-                cr, px + 0.75, py + 0.75, self.width - 1.5, self.height - 1.5, self.RADIUS - 0.5
+                cr, 0.75, 0.75, self.width - 1.5, self.height - 1.5, self.RADIUS - 0.5
             )
             cr.set_line_width(1.0)
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.26)
@@ -1114,14 +1156,14 @@ def run_dock():
 
             layout = PangoCairo.create_layout(cr)
             layout.set_font_description(Pango.FontDescription("Sans Medium 11"))
-            y0 = py + self.PAD_Y
+            y0 = self.PAD_Y
             for i, entry in enumerate(self.entries):
                 if entry.get("separator"):
                     cy = y0 + 4.0
                     cr.set_source_rgba(0.08, 0.10, 0.13, 0.20)
                     cr.set_line_width(1.0)
-                    cr.move_to(px + self.PAD_X, cy)
-                    cr.line_to(px + self.width - self.PAD_X, cy)
+                    cr.move_to(self.PAD_X, cy)
+                    cr.line_to(self.width - self.PAD_X, cy)
                     cr.stroke()
                     y0 += 9
                     continue
@@ -1129,7 +1171,7 @@ def run_dock():
                 sensitive = entry.get("sensitive", True)
                 if i == self.hover and sensitive:
                     rounded_rectangle(
-                        cr, px + 6, y0 + 2, self.width - 12, self.ROW_H - 4, 8
+                        cr, 6, y0 + 2, self.width - 12, self.ROW_H - 4, 8
                     )
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.28)
                     cr.fill()
@@ -1140,7 +1182,7 @@ def run_dock():
                     cr.set_source_rgba(0.10, 0.12, 0.15, 0.94)
                 else:
                     cr.set_source_rgba(0.10, 0.12, 0.15, 0.40)
-                cr.move_to(px + self.PAD_X, y0 + (self.ROW_H - th) / 2.0)
+                cr.move_to(self.PAD_X, y0 + (self.ROW_H - th) / 2.0)
                 PangoCairo.show_layout(cr, layout)
                 y0 += self.ROW_H
             return False
