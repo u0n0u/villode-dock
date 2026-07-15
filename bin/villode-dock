@@ -32,6 +32,7 @@ CONFIG_DIR = Path.home() / ".config" / "villode-dock"
 PINS_FILE = CONFIG_DIR / "pins.json"
 PINS_LOCK_FILE = CONFIG_DIR / "pins.lock"
 CAELESTIA_CONFIG = Path.home() / ".config" / "caelestia" / "shell.json"
+CAELESTIA_SCHEMES_DIR = Path.home() / ".cache" / "caelestia" / "schemes"
 DOCK_CONTROL_SOCKET = Path.home() / ".cache" / "villode-dock-control.sock"
 DOCK_APP_MIME = "application/x-villode-dock-app+json"
 APP_DIRS = (
@@ -108,6 +109,21 @@ SKIP_RUNNING_CLASSES = frozenset(
 
 # Cache: lowercase wm class / exec name → desktop_id
 _DESKTOP_CLASS_INDEX = None
+
+
+def color_from_hex(value, fallback):
+    if not isinstance(value, str):
+        return fallback
+    value = value.lstrip("#")
+    if len(value) != 6 or not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        return fallback
+    return tuple(int(value[index : index + 2], 16) / 255.0 for index in range(0, 6, 2))
+
+
+def hex_from_color(color):
+    return "#{:02x}{:02x}{:02x}".format(
+        *(max(0, min(255, round(component * 255))) for component in color)
+    )
 
 
 def terminal_command():
@@ -890,13 +906,118 @@ def run_dock():
         cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
         cr.close_path()
 
-    class GlassContextMenu:
-        """Compact glass menu only (no full-screen dismiss layer).
 
-        Hyprland blurs whole layer surfaces, so the window is sized exactly to
-        the menu panel. Outside clicks are handled by a Hyprland event listener
-        (and Esc). This avoids a second layer stealing menu clicks.
-        """
+    def load_glass_theme():
+        settings = Gtk.Settings.get_default()
+        theme_name = (
+            settings.get_property("gtk-theme-name").lower() if settings is not None else ""
+        )
+        dark = "dark" in theme_name
+        fallback = {
+            "surface": (0.11, 0.13, 0.16) if dark else (0.78, 0.84, 0.91),
+            "text": (0.91, 0.93, 0.97) if dark else (0.10, 0.12, 0.15),
+            "muted": (0.68, 0.71, 0.76) if dark else (0.29, 0.32, 0.38),
+            "outline": (0.32, 0.35, 0.40) if dark else (0.57, 0.62, 0.68),
+            "primary": (0.66, 0.79, 0.91) if dark else (0.23, 0.39, 0.58),
+            "alpha": 0.34,
+        }
+        palette = {}
+        try:
+            palettes = sorted(
+                CAELESTIA_SCHEMES_DIR.rglob("*.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for path in palettes:
+                data = json.loads(path.read_text())
+                if isinstance(data, dict) and "surface" in data and "onSurface" in data:
+                    palette = data
+                    break
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+        try:
+            transparency = json.loads(CAELESTIA_CONFIG.read_text()).get(
+                "appearance", {}
+            ).get("transparency", {})
+            alpha = float(transparency.get("layers", fallback["alpha"]))
+            if not transparency.get("enabled", True):
+                alpha = 0.94
+            fallback["alpha"] = max(0.12, min(0.94, alpha))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+        return {
+            "surface": color_from_hex(
+                palette.get("surfaceContainerHigh"), fallback["surface"]
+            ),
+            "text": color_from_hex(palette.get("onSurface"), fallback["text"]),
+            "muted": color_from_hex(
+                palette.get("onSurfaceVariant"), fallback["muted"]
+            ),
+            "outline": color_from_hex(
+                palette.get("outlineVariant"), fallback["outline"]
+            ),
+            "primary": color_from_hex(palette.get("primary"), fallback["primary"]),
+            "alpha": fallback["alpha"],
+        }
+
+
+    def create_dismiss_layer(gdk_monitor, callback):
+        window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        window.set_app_paintable(True)
+        window.set_decorated(False)
+        window.set_resizable(False)
+        window.set_accept_focus(False)
+        window.set_skip_taskbar_hint(True)
+        window.set_skip_pager_hint(True)
+        visual = window.get_screen().get_rgba_visual()
+        if visual is not None:
+            window.set_visual(visual)
+        GtkLayerShell.init_for_window(window)
+        GtkLayerShell.set_namespace(window, "villode-dock-menu-dismiss")
+        GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.NONE)
+        GtkLayerShell.set_exclusive_zone(window, -1)
+        for edge in (
+            GtkLayerShell.Edge.TOP,
+            GtkLayerShell.Edge.BOTTOM,
+            GtkLayerShell.Edge.LEFT,
+            GtkLayerShell.Edge.RIGHT,
+        ):
+            GtkLayerShell.set_anchor(window, edge, True)
+        if gdk_monitor is not None:
+            try:
+                GtkLayerShell.set_monitor(window, gdk_monitor)
+            except Exception:
+                pass
+
+        area = Gtk.DrawingArea()
+        area.set_app_paintable(True)
+        area.set_size_request(1, 1)
+        area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+
+        def clear(_widget, cr):
+            cr.set_operator(cairo.OPERATOR_SOURCE)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+            cr.paint()
+            return False
+
+        area.connect("draw", clear)
+
+        def dismiss(*_args):
+            GLib.idle_add(callback)
+            return True
+
+        area.connect("button-press-event", dismiss)
+        window.connect("button-press-event", dismiss)
+        window.add(area)
+        window.show_all()
+        return window
+
+
+    class GlassContextMenu:
+        """Compact glass menu with a transparent outside-click dismiss layer."""
 
         ROW_H = 36
         PAD_X = 16
@@ -915,8 +1036,8 @@ def run_dock():
             self.area = None
             self.width = self.MIN_WIDTH
             self.height = self.PAD_Y * 2
-            self.outside_listener = None
-            self.outside_stop = False
+            self.dismiss = None
+            self.theme = load_glass_theme()
 
         @classmethod
         def close_active(cls):
@@ -978,6 +1099,8 @@ def run_dock():
             margin_left = int(round(left))
             margin_top = int(round(top))
             gdk_monitor = self._gdk_monitor_for(hypr_mon)
+            self.theme = load_glass_theme()
+            self.dismiss = create_dismiss_layer(gdk_monitor, self.close)
 
             window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
             window.set_app_paintable(True)
@@ -1044,6 +1167,16 @@ def run_dock():
                 GlassContextMenu._active = None
             self.window = None
             self.area = None
+            self.close_dismiss()
+
+        def close_dismiss(self):
+            dismiss = self.dismiss
+            self.dismiss = None
+            if dismiss is not None:
+                try:
+                    dismiss.destroy()
+                except Exception:
+                    pass
 
         def close(self):
             win = self.window
@@ -1051,6 +1184,7 @@ def run_dock():
             self.area = None
             if GlassContextMenu._active is self:
                 GlassContextMenu._active = None
+            self.close_dismiss()
             if win is not None:
                 try:
                     win.destroy()
@@ -1123,14 +1257,14 @@ def run_dock():
             rounded_rectangle(
                 cr, 0.5, 0.5, self.width - 1.0, self.height - 1.0, self.RADIUS
             )
-            cr.set_source_rgba(0.78, 0.84, 0.91, 0.34)
+            cr.set_source_rgba(*self.theme["surface"], self.theme["alpha"])
             cr.fill_preserve()
             cr.clip()
 
             sheen = cairo.LinearGradient(0, 0, 0, self.height)
-            sheen.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.20)
-            sheen.add_color_stop_rgba(0.45, 1.0, 1.0, 1.0, 0.07)
-            sheen.add_color_stop_rgba(1.0, 0.72, 0.80, 0.90, 0.04)
+            sheen.add_color_stop_rgba(0.0, *self.theme["text"], 0.18)
+            sheen.add_color_stop_rgba(0.45, *self.theme["text"], 0.06)
+            sheen.add_color_stop_rgba(1.0, *self.theme["primary"], 0.05)
             cr.set_source(sheen)
             cr.paint()
             cr.reset_clip()
@@ -1140,7 +1274,7 @@ def run_dock():
                 cr, 0.75, 0.75, self.width - 1.5, self.height - 1.5, self.RADIUS - 0.5
             )
             cr.set_line_width(1.0)
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.26)
+            cr.set_source_rgba(*self.theme["outline"], 0.68)
             cr.stroke()
 
             layout = PangoCairo.create_layout(cr)
@@ -1149,7 +1283,7 @@ def run_dock():
             for i, entry in enumerate(self.entries):
                 if entry.get("separator"):
                     cy = y0 + 4.0
-                    cr.set_source_rgba(0.08, 0.10, 0.13, 0.20)
+                    cr.set_source_rgba(*self.theme["outline"], 0.46)
                     cr.set_line_width(1.0)
                     cr.move_to(self.PAD_X, cy)
                     cr.line_to(self.width - self.PAD_X, cy)
@@ -1162,15 +1296,15 @@ def run_dock():
                     rounded_rectangle(
                         cr, 6, y0 + 2, self.width - 12, self.ROW_H - 4, 8
                     )
-                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.28)
+                    cr.set_source_rgba(*self.theme["primary"], 0.22)
                     cr.fill()
 
                 layout.set_text(entry.get("label", ""), -1)
                 _tw, th = layout.get_pixel_size()
                 if sensitive:
-                    cr.set_source_rgba(0.10, 0.12, 0.15, 0.94)
+                    cr.set_source_rgba(*self.theme["text"], 0.96)
                 else:
-                    cr.set_source_rgba(0.10, 0.12, 0.15, 0.40)
+                    cr.set_source_rgba(*self.theme["muted"], 0.52)
                 cr.move_to(self.PAD_X, y0 + (self.ROW_H - th) / 2.0)
                 PangoCairo.show_layout(cr, layout)
                 y0 += self.ROW_H
@@ -1189,6 +1323,7 @@ def run_dock():
             self.parent = parent
             self.window = None
             self.dismiss = None
+            self.theme = load_glass_theme()
 
         @classmethod
         def close_active(cls):
@@ -1214,15 +1349,17 @@ def run_dock():
 
             gdk_monitor = None
             display = Gdk.Display.get_default()
-            if display is not None and hypr_mon is not None:
-                for i in range(display.get_n_monitors()):
-                    m = display.get_monitor(i)
-                    g = m.get_geometry()
-                    if abs(g.x - mon_x) < 2 and abs(g.y - mon_y) < 2:
-                        gdk_monitor = m
-                        break
+            if display is not None:
+                if hypr_mon is not None:
+                    for i in range(display.get_n_monitors()):
+                        m = display.get_monitor(i)
+                        g = m.get_geometry()
+                        if abs(g.x - mon_x) < 2 and abs(g.y - mon_y) < 2:
+                            gdk_monitor = m
+                            break
                 if gdk_monitor is None:
                     gdk_monitor = display.get_primary_monitor()
+            self.theme = load_glass_theme()
 
             def make_layer(namespace, keyboard=False):
                 win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
@@ -1252,6 +1389,7 @@ def run_dock():
                         pass
                 return win
 
+            self.dismiss = create_dismiss_layer(gdk_monitor, self.close)
             window = make_layer("villode-dock-menu", keyboard=True)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.LEFT, True)
@@ -1290,15 +1428,17 @@ def run_dock():
 
             name = Gtk.Label()
             name.set_markup(
-                "<span size='xx-large' weight='bold' foreground='#1a1d22'>"
-                "Villode Dock</span>"
+                "<span size='xx-large' weight='bold' foreground='{}'>"
+                "Villode Dock</span>".format(hex_from_color(self.theme["text"]))
             )
             name.set_justify(Gtk.Justification.CENTER)
             page.pack_start(name, False, False, 0)
 
             summary = Gtk.Label()
             summary.set_markup(
-                "<span foreground='#2a2f38'>为 Hyprland 与 Wayland 设计的桌面 Dock</span>"
+                "<span foreground='{}'>为 Hyprland 与 Wayland 设计的桌面 Dock</span>".format(
+                    hex_from_color(self.theme["text"])
+                )
             )
             summary.set_margin_top(5)
             summary.set_margin_bottom(18)
@@ -1306,15 +1446,17 @@ def run_dock():
 
             details = Gtk.Label()
             details.set_markup(
-                "<span foreground='#2a2f38'>"
-                "GTK 3  ·  GtkLayerShell  ·  实时合成器模糊</span>"
+                "<span foreground='{}'>"
+                "GTK 3  ·  GtkLayerShell  ·  实时合成器模糊</span>".format(
+                    hex_from_color(self.theme["text"])
+                )
             )
             details.set_margin_bottom(14)
             page.pack_start(details, False, False, 0)
 
             project = Gtk.Label()
             project.set_markup(
-                "<a href='https://github.com/Villode/villode-dock'>"
+                "<a href='https://github.com/u0n0u/villode-dock'>"
                 "GitHub 项目主页</a>"
             )
             project.connect(
@@ -1325,10 +1467,10 @@ def run_dock():
 
             credits = Gtk.Label()
             credits.set_markup(
-                "<span foreground='#4a5160' size='small'>"
+                "<span foreground='{}' size='small'>"
                 "部分图标来自 macOSicons.com 及相应作者"
                 "  ·  <a href='villode-credits://icons'>完整署名</a>"
-                "</span>"
+                "</span>".format(hex_from_color(self.theme["muted"]))
             )
             credits.set_margin_top(18)
             credits.set_justify(Gtk.Justification.CENTER)
@@ -1367,13 +1509,13 @@ def run_dock():
             rounded_rectangle(
                 cr, 0.5, 0.5, self.WIDTH - 1.0, self.HEIGHT - 1.0, self.RADIUS
             )
-            cr.set_source_rgba(0.78, 0.84, 0.91, 0.34)
+            cr.set_source_rgba(*self.theme["surface"], self.theme["alpha"])
             cr.fill_preserve()
             cr.clip()
             sheen = cairo.LinearGradient(0, 0, 0, self.HEIGHT)
-            sheen.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.20)
-            sheen.add_color_stop_rgba(0.45, 1.0, 1.0, 1.0, 0.07)
-            sheen.add_color_stop_rgba(1.0, 0.72, 0.80, 0.90, 0.04)
+            sheen.add_color_stop_rgba(0.0, *self.theme["text"], 0.18)
+            sheen.add_color_stop_rgba(0.45, *self.theme["text"], 0.06)
+            sheen.add_color_stop_rgba(1.0, *self.theme["primary"], 0.05)
             cr.set_source(sheen)
             cr.paint()
             cr.reset_clip()
@@ -1382,7 +1524,7 @@ def run_dock():
                 cr, 0.75, 0.75, self.WIDTH - 1.5, self.HEIGHT - 1.5, self.RADIUS - 0.5
             )
             cr.set_line_width(1.0)
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.24)
+            cr.set_source_rgba(*self.theme["outline"], 0.68)
             cr.stroke()
             return False
 
@@ -1396,14 +1538,23 @@ def run_dock():
             if GlassAboutDialog._active is self:
                 GlassAboutDialog._active = None
             self.window = None
+            self.close_dismiss()
+
+        def close_dismiss(self):
+            dismiss = self.dismiss
             self.dismiss = None
+            if dismiss is not None:
+                try:
+                    dismiss.destroy()
+                except Exception:
+                    pass
 
         def close(self):
             win = self.window
             self.window = None
-            self.dismiss = None
             if GlassAboutDialog._active is self:
                 GlassAboutDialog._active = None
+            self.close_dismiss()
             if win is not None:
                 try:
                     win.destroy()
@@ -2539,6 +2690,8 @@ def run_dock():
             return False
 
         def on_button_press(self, _widget, event):
+            GlassContextMenu.close_active()
+            GlassAboutDialog.close_active()
             index = self.hit_test(event.x, event.y)
             if event.button == Gdk.BUTTON_PRIMARY:
                 self.pressed = index
