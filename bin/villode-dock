@@ -661,9 +661,31 @@ def toggle_daemon():
 
 
 def spawn_command(command):
+    """Launch on the currently focused Hyprland workspace.
+
+    Dock is a long-lived daemon. Direct Popen inherits the daemon's initial
+    workspace for Hyprland's initial_workspace_tracking, so apps opened from an
+    empty workspace can land on workspace 1. Prefer hyprctl dispatch exec.
+    """
+    if not command:
+        return False
+    argv = [str(part) for part in command]
+    try:
+        result = subprocess.run(
+            ["hyprctl", "dispatch", "exec", "--", *argv],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     try:
         subprocess.Popen(
-            command,
+            argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
