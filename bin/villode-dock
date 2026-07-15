@@ -2884,8 +2884,6 @@ def run_dock():
                                             "workspace>>",
                                             "workspacev2>>",
                                             "focusedmon>>",
-                                            "activewindow>>",
-                                            "activewindowv2>>",
                                         )
                                     ):
                                         GLib.idle_add(self.request_state_refresh_once)
