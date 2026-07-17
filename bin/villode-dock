@@ -1630,6 +1630,8 @@ def run_dock():
             self.internal_drag_active = False
             self.internal_drop_index = None
             self.internal_remove_armed = False
+            # {address: original_workspace_id} — tracks minimized windows.
+            self._minimized = {}
             self.rebuild_items(resize=False)
             self.set_size_request(self.surface_width, WINDOW_HEIGHT)
 
@@ -2820,6 +2822,33 @@ def run_dock():
                 return False
             return spawn_command(["hyprctl", "dispatch", "focuswindow", f"address:{address}"])
 
+        def _active_workspace_id(self):
+            active = hypr_json("activeworkspace")
+            if isinstance(active, dict):
+                return active.get("id")
+            return None
+
+        def _client_is_focused(self, client):
+            active_id = self._active_workspace_id()
+            if active_id is None:
+                return False
+            ws = client.get("workspace", {})
+            ws_id = ws.get("id") if isinstance(ws, dict) else None
+            if ws_id != active_id:
+                return False
+            focus_id = client.get("focusHistoryID")
+            if focus_id is None:
+                return False
+            # Highest focusHistoryID on the active workspace = focused window.
+            max_focus = -1
+            for c in self.clients:
+                cws = c.get("workspace", {})
+                if isinstance(cws, dict) and cws.get("id") == active_id:
+                    f = c.get("focusHistoryID")
+                    if f is not None and f > max_focus:
+                        max_focus = f
+            return max_focus == focus_id
+
         def activate(self, index, force_new=False):
             item = self.items[index]
             focusable = (
@@ -2828,8 +2857,34 @@ def run_dock():
             )
             if focusable and not force_new:
                 client = self.matching_client(item)
-                if client is not None and self.focus_client(client):
-                    return
+                if client is not None:
+                    addr = str(client.get("address", ""))
+                    ws = client.get("workspace", {})
+                    ws_id = ws.get("id") if isinstance(ws, dict) else None
+                    ws_name = ws.get("name", "") if isinstance(ws, dict) else ""
+                    is_special = isinstance(ws_name, str) and ws_name.startswith("special:")
+                    is_on_active = (ws_id is not None and ws_id == self._active_workspace_id())
+                    is_focused = self._client_is_focused(client)
+
+                    if addr and addr in self._minimized:
+                        # Window was minimized → restore to original workspace and focus.
+                        orig_ws = self._minimized.pop(addr)
+                        spawn_command(["hyprctl", "dispatch", "movetoworkspacesilent", str(orig_ws), f"address:{addr}"])
+                        spawn_command(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"])
+                        item["bounce_start"] = time.monotonic()
+                        self.ensure_tick()
+                        return
+
+                    if is_focused and not force_new:
+                        # Window is focused → minimize (move to special workspace).
+                        if addr:
+                            self._minimized[addr] = ws_id or 1
+                        spawn_command(["hyprctl", "dispatch", "movetoworkspacesilent", f"special:{addr}", f"address:{addr}"])
+                        return
+
+                    # Window not focused → focus it.
+                    if self.focus_client(client):
+                        return
             if item["kind"] == "desktop" and item.get("desktop_id"):
                 command = ["gtk-launch", item["desktop_id"]]
             elif item["kind"] == "running":
@@ -3130,6 +3185,10 @@ def run_dock():
                 }
                 clients_changed = old_addrs != new_addrs
                 self.clients = clients
+                # Clean up minimized tracking for closed windows.
+                for addr in list(self._minimized.keys()):
+                    if addr not in new_addrs:
+                        del self._minimized[addr]
             if fullscreen is not None:
                 self.set_fullscreen_hidden(fullscreen)
 
