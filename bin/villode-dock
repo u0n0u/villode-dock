@@ -1510,7 +1510,8 @@ def run_dock():
             window.connect("destroy", lambda *_: self._cleared())
 
             self.window = window
-            self.dismiss = None
+            # Keep self.dismiss from create_dismiss_layer above — do NOT clear it
+            # here or the full-screen click-catcher leaks and freezes input.
             GlassAboutDialog._active = self
             window.show_all()
             window.present()
