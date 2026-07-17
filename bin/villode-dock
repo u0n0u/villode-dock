@@ -964,6 +964,7 @@ def run_dock():
 
 
     def create_dismiss_layer(gdk_monitor, callback):
+        """Fullscreen click-catcher. Near-invisible alpha so Wayland still hits it."""
         window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         window.set_app_paintable(True)
         window.set_decorated(False)
@@ -978,6 +979,7 @@ def run_dock():
         GtkLayerShell.set_namespace(window, "villode-dock-menu-dismiss")
         GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
         GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.NONE)
+        # -1 = cover full screen and participate in input.
         GtkLayerShell.set_exclusive_zone(window, -1)
         for edge in (
             GtkLayerShell.Edge.TOP,
@@ -992,14 +994,22 @@ def run_dock():
             except Exception:
                 pass
 
-        area = Gtk.DrawingArea()
+        area = Gtk.EventBox()
         area.set_app_paintable(True)
+        area.set_visible_window(True)
+        area.set_above_child(True)
         area.set_size_request(1, 1)
-        area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
 
         def clear(_widget, cr):
+            # Completely transparent surfaces often receive no input on Wayland;
+            # keep a tiny alpha so hit-testing works (still look invisible).
             cr.set_operator(cairo.OPERATOR_SOURCE)
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.01)
             cr.paint()
             return False
 
@@ -1010,9 +1020,13 @@ def run_dock():
             return True
 
         area.connect("button-press-event", dismiss)
+        area.connect("button-release-event", dismiss)
         window.connect("button-press-event", dismiss)
+        window.connect("button-release-event", dismiss)
         window.add(area)
         window.show_all()
+        # Raise after map so we sit above the dock but under the menu (order rules).
+        GLib.idle_add(window.present)
         return window
 
 
