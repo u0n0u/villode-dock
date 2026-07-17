@@ -2863,26 +2863,22 @@ def run_dock():
                     ws_id = ws.get("id") if isinstance(ws, dict) else None
                     ws_name = ws.get("name", "") if isinstance(ws, dict) else ""
                     is_special = isinstance(ws_name, str) and ws_name.startswith("special:")
-                    is_on_active = (ws_id is not None and ws_id == self._active_workspace_id())
                     is_focused = self._client_is_focused(client)
 
-                    if addr and addr in self._minimized:
-                        # Window was minimized → restore to original workspace and focus.
-                        orig_ws = self._minimized.pop(addr)
+                    # Minimized (on special workspace) → restore.
+                    if is_special and addr:
+                        orig_ws = self._minimized.pop(addr, ws_id or 1)
                         spawn_command(["hyprctl", "dispatch", "movetoworkspacesilent", str(orig_ws), f"address:{addr}"])
                         spawn_command(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"])
                         item["bounce_start"] = time.monotonic()
                         self.ensure_tick()
                         return
 
-                    if is_focused and not force_new:
-                        # Window is focused → minimize (move to special workspace).
-                        if addr:
-                            self._minimized[addr] = ws_id or 1
-                        spawn_command(["hyprctl", "dispatch", "movetoworkspacesilent", f"special:{addr}", f"address:{addr}"])
+                    # Already focused → do nothing (user may have meant to click elsewhere).
+                    if is_focused:
                         return
 
-                    # Window not focused → focus it.
+                    # Visible on another workspace → focus it.
                     if self.focus_client(client):
                         return
             if item["kind"] == "desktop" and item.get("desktop_id"):
