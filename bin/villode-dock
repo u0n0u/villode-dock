@@ -977,9 +977,10 @@ def run_dock():
             window.set_visual(visual)
         GtkLayerShell.init_for_window(window)
         GtkLayerShell.set_namespace(window, "villode-dock-menu-dismiss")
-        GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+        # Must sit above menu (order 60) so it catches clicks outside the menu
+        # while the menu still receives clicks inside its own bounds.
+        GtkLayerShell.set_layer(window, GtkLayerShell.Layer.TOP)
         GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.NONE)
-        # -1 = cover full screen and participate in input.
         GtkLayerShell.set_exclusive_zone(window, -1)
         for edge in (
             GtkLayerShell.Edge.TOP,
@@ -1131,7 +1132,7 @@ def run_dock():
             GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
             # Exclusive keyboard so Esc always reaches us.
             GtkLayerShell.set_keyboard_mode(
-                window, GtkLayerShell.KeyboardMode.EXCLUSIVE
+                window, GtkLayerShell.KeyboardMode.ON_DEMAND
             )
             GtkLayerShell.set_exclusive_zone(window, -1)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
@@ -1411,7 +1412,7 @@ def run_dock():
             GtkLayerShell.set_margin(window, GtkLayerShell.Edge.LEFT, max(0, margin_left))
             try:
                 GtkLayerShell.set_keyboard_mode(
-                    window, GtkLayerShell.KeyboardMode.EXCLUSIVE
+                    window, GtkLayerShell.KeyboardMode.ON_DEMAND
                 )
             except Exception:
                 pass
