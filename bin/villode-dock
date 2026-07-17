@@ -2629,17 +2629,28 @@ def run_dock():
             if (
                 self.pressed is not None
                 and self.press_position is not None
+                and not getattr(self, "pressed_clicked", False)
                 and 0 < self.pressed < self.group_break
-                and math.hypot(
+            ):
+                dist = math.hypot(
                     event.x - self.press_position[0],
                     event.y - self.press_position[1],
-                ) >= 8.0
-            ):
-                self.internal_drag_active = True
-                self.internal_drop_index = self.internal_index_for_x(event.x)
-                self.update_internal_remove_state(event.y)
-                self.pointer_inside = not self.internal_remove_armed
-                self.update_pointer_cursor()
+                )
+                elapsed = time.monotonic() - getattr(self, "press_time", 0.0)
+                # Start drag on ANY movement after the hold threshold.
+                # Before the threshold, require an 8px move to avoid accidental drags.
+                can_start_drag = elapsed >= 0.4 or dist >= 8.0
+                if can_start_drag and not self.internal_drag_active:
+                    self.internal_drag_active = True
+                    self.internal_drop_index = self.internal_index_for_x(event.x)
+                    self.update_internal_remove_state(event.y)
+                    self.pointer_inside = not self.internal_remove_armed
+                    self.update_pointer_cursor()
+                elif self.internal_drag_active:
+                    self.internal_drop_index = self.internal_index_for_x(event.x)
+                    self.update_internal_remove_state(event.y)
+                    self.pointer_inside = not self.internal_remove_armed
+                    self.update_pointer_cursor()
             self.set_hovered(self.hit_test(event.x, event.y))
             self.update_targets()
             self.queue_draw()
@@ -2712,6 +2723,8 @@ def run_dock():
             if event.button == Gdk.BUTTON_PRIMARY:
                 self.pressed = index
                 self.press_position = (event.x, event.y)
+                self.press_time = time.monotonic()
+                self.pressed_clicked = False
                 self.queue_draw()
                 return index is not None
             if event.button == Gdk.BUTTON_SECONDARY:
@@ -2725,6 +2738,8 @@ def run_dock():
             released = self.hit_test(event.x, event.y)
             pressed = self.pressed
             press_position = self.press_position
+            press_time = getattr(self, "press_time", 0.0)
+            clicked = getattr(self, "pressed_clicked", False)
             internal_drag = self.internal_drag_active
             internal_drop_index = self.internal_drop_index
             remove_armed = self.internal_remove_armed
@@ -2740,6 +2755,8 @@ def run_dock():
             )
             self.pressed = None
             self.press_position = None
+            self.press_time = 0.0
+            self.pressed_clicked = False
             self.internal_drag_active = False
             self.internal_drop_index = None
             self.internal_remove_armed = False
@@ -2761,7 +2778,8 @@ def run_dock():
                     event.x - press_position[0], event.y - press_position[1]
                 ) < 10.0
             )
-            if pressed is not None and (released == pressed or stayed_put):
+            duration = time.monotonic() - press_time if press_time else 0.0
+            if pressed is not None and not clicked and stayed_put and duration < 0.4:
                 self.activate(pressed)
                 return True
             return False
