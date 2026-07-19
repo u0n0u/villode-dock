@@ -35,6 +35,39 @@ CAELESTIA_CONFIG = Path.home() / ".config" / "caelestia" / "shell.json"
 CAELESTIA_SCHEMES_DIR = Path.home() / ".cache" / "caelestia" / "schemes"
 DOCK_CONTROL_SOCKET = Path.home() / ".cache" / "villode-dock-control.sock"
 DOCK_APP_MIME = "application/x-villode-dock-app+json"
+# Shared with Launcher / Nexus Mouse settings (PointerDevices).
+CLICK_SETTINGS_PATH = (
+    Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state"))
+    / "caelestia"
+    / "mouse-settings.json"
+)
+_CLICK = {
+    "long_press_s": 0.25,
+    "drag_arm_px": 10.0,
+    "click_slop_px": 10.0,
+    "click_guard_s": 0.22,
+}
+
+
+def load_click_settings(path=None):
+    """Load click/long-press thresholds written by Nexus Mouse settings."""
+    target = Path(path) if path else CLICK_SETTINGS_PATH
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return dict(_CLICK)
+    if isinstance(data.get("longPressMs"), (int, float)):
+        _CLICK["long_press_s"] = max(0.1, min(0.6, float(data["longPressMs"]) / 1000.0))
+    if isinstance(data.get("dragArmPx"), (int, float)):
+        _CLICK["drag_arm_px"] = max(2.0, min(30.0, float(data["dragArmPx"])))
+    if isinstance(data.get("clickGuardMs"), (int, float)):
+        _CLICK["click_guard_s"] = max(0.0, min(0.5, float(data["clickGuardMs"]) / 1000.0))
+    # clickSlop not exposed yet — keep drag arm as movement slop floor
+    _CLICK["click_slop_px"] = max(6.0, _CLICK["drag_arm_px"])
+    return dict(_CLICK)
+
+
+load_click_settings()
 APP_DIRS = (
     Path.home() / ".local" / "share" / "applications",
     Path("/usr/local/share/applications"),
@@ -895,6 +928,11 @@ def run_dock():
     MAX_SCALE = 1.50
     WAVE_RADIUS = 145.0
     TOOLTIP_DELAY = 0.28
+    # Defaults; live values come from load_click_settings() / mouse-settings.json.
+    DOCK_LONG_PRESS_S = _CLICK["long_press_s"]
+    DOCK_DRAG_ARM_PX = _CLICK["drag_arm_px"]
+    DOCK_CLICK_SLOP_PX = _CLICK["click_slop_px"]
+    DOCK_CLICK_GUARD_S = _CLICK["click_guard_s"]
 
 
     def rounded_rectangle(cr, x, y, width, height, radius):
@@ -1612,6 +1650,9 @@ def run_dock():
             self.hover_since = 0.0
             self.pressed = None
             self.press_position = None
+            self.press_time = 0.0
+            self.pressed_clicked = False
+            self.click_guard_until = 0.0
             self.tick_id = None
             self.last_frame_us = None
             self.last_input_rects = None
@@ -1630,8 +1671,6 @@ def run_dock():
             self.internal_drag_active = False
             self.internal_drop_index = None
             self.internal_remove_armed = False
-            # {address: original_workspace_id} — tracks minimized windows.
-            self._minimized = {}
             self.rebuild_items(resize=False)
             self.set_size_request(self.surface_width, WINDOW_HEIGHT)
 
@@ -1662,7 +1701,37 @@ def run_dock():
             self.request_state_refresh()
             self.start_hypr_event_listener()
             self.start_trash_monitor()
+            self.start_click_settings_monitor()
             GLib.timeout_add_seconds(60, self.request_state_refresh)
+
+        def start_click_settings_monitor(self):
+            """Hot-reload long-press / click guard from Nexus mouse settings."""
+            load_click_settings()
+            try:
+                directory = str(CLICK_SETTINGS_PATH.parent)
+                Path(directory).mkdir(parents=True, exist_ok=True)
+                mon = Gio.File.new_for_path(directory).monitor_directory(
+                    Gio.FileMonitorFlags.NONE, None
+                )
+
+                def on_changed(_mon, file, _other, event):
+                    try:
+                        name = file.get_basename() if file is not None else ""
+                    except Exception:
+                        name = ""
+                    if name and name != CLICK_SETTINGS_PATH.name:
+                        return
+                    load_click_settings()
+
+                mon.connect("changed", on_changed)
+                self._click_settings_monitor = mon
+            except Exception:
+                # Polling fallback if monitor fails.
+                def poll():
+                    load_click_settings()
+                    return True
+
+                GLib.timeout_add_seconds(2, poll)
 
         def new_item(
             self,
@@ -2638,11 +2707,14 @@ def run_dock():
                     event.x - self.press_position[0],
                     event.y - self.press_position[1],
                 )
+                # Long-press first, then movement arms reorder. Pure movement
+                # before the hold threshold never steals a short click.
                 elapsed = time.monotonic() - getattr(self, "press_time", 0.0)
-                # Start drag on ANY movement after the hold threshold.
-                # Before the threshold, require an 8px move to avoid accidental drags.
-                can_start_drag = elapsed >= 0.4 or dist >= 8.0
-                if can_start_drag and not self.internal_drag_active:
+                if (
+                    not self.internal_drag_active
+                    and elapsed >= _CLICK["long_press_s"]
+                    and dist >= _CLICK["drag_arm_px"]
+                ):
                     self.internal_drag_active = True
                     self.internal_drop_index = self.internal_index_for_x(event.x)
                     self.update_internal_remove_state(event.y)
@@ -2723,9 +2795,13 @@ def run_dock():
             GlassAboutDialog.close_active()
             index = self.hit_test(event.x, event.y)
             if event.button == Gdk.BUTTON_PRIMARY:
+                now = time.monotonic()
+                # Swallow bounce re-press while the last activation is cooling down.
+                if now < getattr(self, "click_guard_until", 0.0):
+                    return True
                 self.pressed = index
                 self.press_position = (event.x, event.y)
-                self.press_time = time.monotonic()
+                self.press_time = now
                 self.pressed_clicked = False
                 self.queue_draw()
                 return index is not None
@@ -2737,7 +2813,6 @@ def run_dock():
         def on_button_release(self, _widget, event):
             if event.button != Gdk.BUTTON_PRIMARY:
                 return False
-            released = self.hit_test(event.x, event.y)
             pressed = self.pressed
             press_position = self.press_position
             press_time = getattr(self, "press_time", 0.0)
@@ -2774,14 +2849,23 @@ def run_dock():
             ):
                 self.reorder_pinned(pressed, internal_drop_index)
                 return True
+            # Click only when the press was short and stayed put. Long-press
+            # without drag is ignored (macOS Dock: hold arms move, not launch).
+            duration = time.monotonic() - press_time if press_time else 0.0
             stayed_put = (
                 press_position is not None
                 and math.hypot(
                     event.x - press_position[0], event.y - press_position[1]
-                ) < 10.0
+                )
+                < _CLICK["click_slop_px"]
             )
-            duration = time.monotonic() - press_time if press_time else 0.0
-            if pressed is not None and not clicked and stayed_put and duration < 0.4:
+            if (
+                pressed is not None
+                and not clicked
+                and stayed_put
+                and duration < _CLICK["long_press_s"]
+            ):
+                self.click_guard_until = time.monotonic() + _CLICK["click_guard_s"]
                 self.activate(pressed)
                 return True
             return False
@@ -2822,32 +2906,6 @@ def run_dock():
                 return False
             return spawn_command(["hyprctl", "dispatch", "focuswindow", f"address:{address}"])
 
-        def _active_workspace_id(self):
-            active = hypr_json("activeworkspace")
-            if isinstance(active, dict):
-                return active.get("id")
-            return None
-
-        def _client_is_focused(self, client):
-            active_id = self._active_workspace_id()
-            if active_id is None:
-                return False
-            ws = client.get("workspace", {})
-            ws_id = ws.get("id") if isinstance(ws, dict) else None
-            if ws_id != active_id:
-                return False
-            focus_id = client.get("focusHistoryID")
-            if focus_id is None:
-                return False
-            # Highest focusHistoryID on the active workspace = focused window.
-            max_focus = -1
-            for c in self.clients:
-                cws = c.get("workspace", {})
-                if isinstance(cws, dict) and cws.get("id") == active_id:
-                    f = c.get("focusHistoryID")
-                    if f is not None and f > max_focus:
-                        max_focus = f
-            return max_focus == focus_id
 
         def activate(self, index, force_new=False):
             item = self.items[index]
@@ -2857,34 +2915,11 @@ def run_dock():
             )
             if focusable and not force_new:
                 client = self.matching_client(item)
-                if client is not None:
-                    addr = str(client.get("address", ""))
-                    ws = client.get("workspace", {})
-                    ws_id = ws.get("id") if isinstance(ws, dict) else None
-                    ws_name = ws.get("name", "") if isinstance(ws, dict) else ""
-                    is_special = isinstance(ws_name, str) and ws_name.startswith("special:")
-                    is_focused = self._client_is_focused(client)
-
-                    # Minimized (on special workspace) → restore.
-                    if is_special and addr:
-                        orig_ws = self._minimized.pop(addr, ws_id or 1)
-                        spawn_command(["hyprctl", "dispatch", "movetoworkspacesilent", str(orig_ws), f"address:{addr}"])
-                        spawn_command(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"])
-                        item["bounce_start"] = time.monotonic()
-                        self.ensure_tick()
-                        return
-
-                    # Already focused → do nothing (user may have meant to click elsewhere).
-                    if is_focused:
-                        return
-
-                    # Visible on another workspace → focus it.
-                    if self.focus_client(client):
-                        return
+                if client is not None and self.focus_client(client):
+                    return
             if item["kind"] == "desktop" and item.get("desktop_id"):
                 command = ["gtk-launch", item["desktop_id"]]
             elif item["kind"] == "running":
-                # No desktop file — just try to focus; cannot launch again.
                 return
             elif item["action"] == "files":
                 command = file_manager_command(Path.home())
@@ -3181,10 +3216,6 @@ def run_dock():
                 }
                 clients_changed = old_addrs != new_addrs
                 self.clients = clients
-                # Clean up minimized tracking for closed windows.
-                for addr in list(self._minimized.keys()):
-                    if addr not in new_addrs:
-                        del self._minimized[addr]
             if fullscreen is not None:
                 self.set_fullscreen_hidden(fullscreen)
 
